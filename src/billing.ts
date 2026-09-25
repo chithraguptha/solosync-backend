@@ -67,6 +67,7 @@ function razorpay() {
 
 export function verifyCheckoutSignature(orderId: string, paymentId: string, signature: string, secret: string) {
   const expected = crypto.createHmac("sha256", secret).update(orderId + "|" + paymentId).digest("hex");
+  if (expected.length !== signature.length) return false;
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
@@ -99,6 +100,7 @@ export export async function markPaymentCaptured(payment: any) {
 
 export async function creditWallet(userId: string, amountPaise: number, referenceId: string, note = "Razorpay wallet top-up") {
   if (amountPaise <= 0) throw new Error("Wallet amount must be positive");
+  if (await WalletTransaction.exists({ type: "topup", referenceId })) return;
   const wallet: any = await Wallet.findOneAndUpdate(
     { userId },
     { $inc: { balancePaise: amountPaise }, $setOnInsert: { userId } },
