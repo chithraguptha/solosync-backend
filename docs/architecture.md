@@ -224,3 +224,8 @@ flowchart TD
   O --> Q[Dashboard analytics]
   P --> Q
 ```
+
+
+## WhatsApp recipient resolution
+
+Before sending to a direct phone number, the publisher resolves the number through WAHA `GET /api/contacts/check-exists`. WAHA can return either a regular `@c.us` chat ID or a migrated `@lid` chat ID; SoloSync persists the resolved ID on the publication before calling `sendText`, `sendImage`, or `sendVideo`. This avoids assuming that every WhatsApp user can still be addressed only by `@c.us`. The WAHA image is pinned rather than floating on `latest`.
