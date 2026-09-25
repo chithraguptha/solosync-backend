@@ -8,6 +8,7 @@ import jwt from "jsonwebtoken";
 import mongoose, { Schema } from "mongoose";
 import crypto from "crypto";
 import { createClient } from "redis";
+import { OAuth2Client } from "google-auth-library";
 import { WahaClient } from "./waha";
 
 const env = {
@@ -18,6 +19,9 @@ const env = {
   WAHA_API_KEY: process.env.WAHA_API_KEY || "",
   WAHA_WEBHOOK_URL: process.env.WAHA_WEBHOOK_URL || "",
   WAHA_WEBHOOK_HMAC_KEY: process.env.WAHA_WEBHOOK_HMAC_KEY || "",
+  GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID || "",
+  GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET || "",
+  GOOGLE_REDIRECT_URI: process.env.GOOGLE_REDIRECT_URI || "http://localhost:4000/api/auth/google/callback",
   BILLING_ENABLED: process.env.BILLING_ENABLED === "true",
   ACTIVATION_FEE_PAISE: Number(process.env.ACTIVATION_FEE_PAISE || 39900),
   MESSAGE_FEE_PAISE: Number(process.env.MESSAGE_FEE_PAISE || 10),
@@ -27,30 +31,56 @@ if (env.NODE_ENV === "production" && env.JWT_SECRET === "change-me") throw Error
 if (env.NODE_ENV === "production" && !env.WAHA_API_KEY) throw Error("WAHA_API_KEY must be configured");
 
 const User = mongoose.model("User", new Schema(
-  { email: { type: String, required: true, unique: true, lowercase: true, trim: true }, passwordHash: { type: String, required: true } },
+  {
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    passwordHash: { type: String },
+    googleId: { type: String, unique: true, sparse: true },
+    name: String,
+    avatarUrl: String,
+    authProvider: { type: String, enum: ["password", "google", "both"], default: "password" },
+  },
   { timestamps: true },
 ));
+
 const WhatsappConnection = mongoose.model("WhatsappConnection", new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
-    provider: { type: String, default: "waha" }, sessionName: { type: String, required: true, unique: true },
-    status: { type: String, default: "STOPPED" }, phoneNumber: String, pushName: String, activationRecorded: { type: Boolean, default: false },
+    provider: { type: String, default: "waha" },
+    sessionName: { type: String, required: true, unique: true },
+    status: { type: String, default: "STOPPED" },
+    phoneNumber: String,
+    pushName: String,
+    activationRecorded: { type: Boolean, default: false },
   },
   { timestamps: true },
 ));
+
 const Publication = mongoose.model("Publication", new Schema(
   {
-    userId: { type: Schema.Types.ObjectId, required: true }, connectionId: { type: Schema.Types.ObjectId, required: true },
-    chatId: { type: String, required: true }, kind: { type: String, default: "text" }, text: String, mediaUrl: String,
-    status: { type: String, default: "queued" }, attempts: { type: Number, default: 0 }, providerMessageId: String, error: String, publishedAt: Date,
+    userId: { type: Schema.Types.ObjectId, required: true, index: true },
+    connectionId: { type: Schema.Types.ObjectId, required: true },
+    chatId: { type: String, required: true, index: true },
+    kind: { type: String, enum: ["text", "image", "video"], default: "text" },
+    text: String,
+    mediaUrl: String,
+    status: { type: String, enum: ["queued", "publishing", "published", "failed"], default: "queued", index: true },
+    attempts: { type: Number, default: 0 },
+    providerMessageId: String,
+    error: String,
+    publishedAt: Date,
   },
   { timestamps: true },
 ));
+
 const BillingLedger = mongoose.model("BillingLedger", new Schema(
   {
-    userId: { type: Schema.Types.ObjectId, required: true }, publicationId: Schema.Types.ObjectId,
-    kind: { type: String, required: true }, units: { type: Number, required: true }, amountPaise: { type: Number, required: true },
-    status: { type: String, default: "recorded" }, note: String,
+    userId: { type: Schema.Types.ObjectId, required: true },
+    publicationId: Schema.Types.ObjectId,
+    kind: { type: String, required: true },
+    units: { type: Number, required: true },
+    amountPaise: { type: Number, required: true },
+    status: { type: String, default: "recorded" },
+    note: String,
   },
   { timestamps: true },
 ));
@@ -58,23 +88,37 @@ const BillingLedger = mongoose.model("BillingLedger", new Schema(
 const redis = createClient({ url: process.env.REDIS_URL || "redis://localhost:6379" });
 const workerRedis = redis.duplicate();
 const waha = new WahaClient({
-  baseUrl: env.WAHA_URL, apiKey: env.WAHA_API_KEY,
-  webhookUrl: env.WAHA_WEBHOOK_URL, webhookHmacKey: env.WAHA_WEBHOOK_HMAC_KEY,
+  baseUrl: env.WAHA_URL,
+  apiKey: env.WAHA_API_KEY,
+  webhookUrl: env.WAHA_WEBHOOK_URL,
+  webhookHmacKey: env.WAHA_WEBHOOK_HMAC_KEY,
 });
+const google = new OAuth2Client(env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.GOOGLE_REDIRECT_URI);
 
 type RawRequest = Request & { rawBody?: Buffer };
 const app = express();
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: env.FRONTEND_ORIGIN, credentials: true }));
 app.use(express.json({ limit: "1mb", verify: (req, _res, buf) => { (req as RawRequest).rawBody = Buffer.from(buf); } }));
 app.use(cookieParser());
-app.use("/api/auth", rateLimit({ windowMs: 60_000, max: 20 }));
+app.use("/api/auth", rateLimit({ windowMs: 60_000, max: 30 }));
 app.use("/api/whatsapp", rateLimit({ windowMs: 60_000, max: 60 }));
 
 const cookies = { httpOnly: true, secure: env.NODE_ENV === "production", sameSite: "lax" as const, path: "/" };
 const access = (id: string) => jwt.sign({ sub: id, type: "access" }, env.JWT_SECRET, { expiresIn: "15m" });
 const refresh = (id: string) => jwt.sign({ sub: id, type: "refresh", jti: crypto.randomUUID() }, env.JWT_SECRET, { expiresIn: "7d" });
-const userView = (u: any) => ({ id: String(u._id), email: u.email, createdAt: u.createdAt });
+const userView = (u: any) => ({
+  id: String(u._id), email: u.email, name: u.name || u.email.split("@")[0],
+  avatarUrl: u.avatarUrl || null, authProvider: u.authProvider, createdAt: u.createdAt,
+});
+
+async function issueSession(res: express.Response, userId: string) {
+  const token = refresh(userId);
+  await redis.setEx("session:" + crypto.createHash("sha256").update(token).digest("hex"), 604800, userId);
+  res.cookie("access_token", access(userId), { ...cookies, maxAge: 900000 });
+  res.cookie("refresh_token", token, { ...cookies, maxAge: 604800000 });
+}
 
 async function auth(req: Request) {
   const token = req.cookies?.access_token;
@@ -85,6 +129,7 @@ async function auth(req: Request) {
   if (!user) throw Error("User not found");
   return user;
 }
+
 const connectionFor = (id: string) => WhatsappConnection.findOne({ userId: id });
 
 async function recordActivation(userId: string, c: any) {
@@ -99,6 +144,8 @@ async function recordActivation(userId: string, c: any) {
 }
 
 async function recordMessage(userId: string, publicationId: any) {
+  const exists = await BillingLedger.exists({ publicationId, kind: "message" });
+  if (exists) return;
   await BillingLedger.create({
     userId, publicationId, kind: "message", units: 1, amountPaise: env.MESSAGE_FEE_PAISE,
     status: env.BILLING_ENABLED ? "pending_charge" : "recorded",
@@ -108,18 +155,32 @@ async function recordMessage(userId: string, publicationId: any) {
 
 async function publish(publicationId: string) {
   const p: any = await Publication.findById(publicationId);
-  if (!p) return;
+  if (!p || p.status === "published") return;
   const c: any = await WhatsappConnection.findById(p.connectionId);
   if (!c) throw Error("WhatsApp connection not found");
-  p.status = "publishing"; p.attempts += 1; await p.save();
 
-  let result: any;
-  if (p.kind === "image" && p.mediaUrl) result = await waha.sendImage(c.sessionName, p.chatId, p.mediaUrl, p.text);
-  else if (p.kind === "video" && p.mediaUrl) result = await waha.sendVideo(c.sessionName, p.chatId, p.mediaUrl, p.text);
-  else result = await waha.sendText(c.sessionName, p.chatId, p.text || "");
+  p.status = "publishing";
+  p.attempts += 1;
+  await p.save();
 
-  p.status = "published"; p.providerMessageId = result?.id || result?.key?.id; p.publishedAt = new Date(); p.error = undefined; await p.save();
-  await recordMessage(String(p.userId), p._id);
+  try {
+    let result: any;
+    if (p.kind === "image" && p.mediaUrl) result = await waha.sendImage(c.sessionName, p.chatId, p.mediaUrl, p.text);
+    else if (p.kind === "video" && p.mediaUrl) result = await waha.sendVideo(c.sessionName, p.chatId, p.mediaUrl, p.text);
+    else result = await waha.sendText(c.sessionName, p.chatId, p.text || "");
+
+    p.status = "published";
+    p.providerMessageId = result?.id || result?.key?.id;
+    p.publishedAt = new Date();
+    p.error = undefined;
+    await p.save();
+    await recordMessage(String(p.userId), p._id);
+  } catch (error: any) {
+    p.status = p.attempts < 3 ? "queued" : "failed";
+    p.error = String(error?.message || error);
+    await p.save();
+    throw error;
+  }
 }
 
 async function worker() {
@@ -127,29 +188,79 @@ async function worker() {
   for (;;) {
     const item = await workerRedis.brPop("solosync:publish", 0);
     if (!item) continue;
-    const job = JSON.parse(item.element);
-    try { await publish(job.publicationId); }
+    try { await publish(JSON.parse(item.element).publicationId); }
     catch (e: any) {
-      const p: any = await Publication.findById(job.publicationId);
-      if (p && p.attempts < 3) await workerRedis.lPush("solosync:publish", JSON.stringify(job));
-      else if (p) { p.status = "failed"; p.error = String(e?.message || e); await p.save(); }
+      const p: any = await Publication.findById(JSON.parse(item.element).publicationId);
+      if (p && p.status === "queued" && p.attempts < 3) await workerRedis.lPush("solosync:publish", item.element);
     }
   }
 }
 
 app.get("/health", (_, res) => res.json({ status: "ok" }));
-app.get("/ready", async (_, res) => { try { await mongoose.connection.db?.command({ ping: 1 }); await redis.ping(); res.json({ status: "ready" }); } catch { res.status(503).json({ status: "not_ready" }); } });
+app.get("/ready", async (_, res) => {
+  try { await mongoose.connection.db?.command({ ping: 1 }); await redis.ping(); res.json({ status: "ready" }); }
+  catch { res.status(503).json({ status: "not_ready" }); }
+});
+
+app.get("/api/auth/google", async (_req, res) => {
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) return res.status(503).json({ message: "Google authentication is not configured" });
+  const state = crypto.randomBytes(32).toString("hex");
+  await redis.setEx("google-oauth:" + state, 600, "1");
+  const url = google.generateAuthUrl({
+    access_type: "online",
+    scope: ["openid", "email", "profile"],
+    state,
+    prompt: "select_account",
+  });
+  res.redirect(url);
+});
+
+app.get("/api/auth/google/callback", async (req, res) => {
+  try {
+    const state = String(req.query.state || "");
+    if (!state || !(await redis.getDel("google-oauth:" + state))) throw Error("Invalid Google authentication state");
+    const code = String(req.query.code || "");
+    if (!code) throw Error("Google authorization was cancelled");
+
+    const { tokens } = await google.getToken(code);
+    if (!tokens.id_token) throw Error("Google did not return an identity token");
+    const ticket = await google.verifyIdToken({ idToken: tokens.id_token, audience: env.GOOGLE_CLIENT_ID });
+    const payload = ticket.getPayload();
+    if (!payload?.sub || !payload.email || payload.email_verified !== true) throw Error("Google account could not be verified");
+
+    let user: any = await User.findOne({ $or: [{ googleId: payload.sub }, { email: payload.email.toLowerCase() }] });
+    if (!user) {
+      user = await User.create({
+        email: payload.email.toLowerCase(),
+        googleId: payload.sub,
+        name: payload.name || payload.email.split("@")[0],
+        avatarUrl: payload.picture,
+        authProvider: "google",
+      });
+    } else {
+      user.googleId = payload.sub;
+      user.name = payload.name || user.name;
+      user.avatarUrl = payload.picture || user.avatarUrl;
+      user.authProvider = user.passwordHash ? "both" : "google";
+      await user.save();
+    }
+
+    await issueSession(res, String(user._id));
+    res.redirect(env.FRONTEND_ORIGIN);
+  } catch (e: any) {
+    const message = encodeURIComponent(e.message || "Google sign-in failed");
+    res.redirect(env.FRONTEND_ORIGIN + "?auth_error=" + message);
+  }
+});
 
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const email = String(req.body.email || "").trim().toLowerCase(), password = String(req.body.password || "");
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
     if (!/^\S+@\S+\.\S+$/.test(email) || password.length < 8) return res.status(400).json({ message: "Valid email and password of at least 8 characters are required" });
-    if (await User.exists({ email })) return res.status(409).json({ message: "Account already exists" });
-    const u: any = await User.create({ email, passwordHash: await bcrypt.hash(password, 12) });
-    const token = refresh(String(u._id));
-    await redis.setEx("session:" + crypto.createHash("sha256").update(token).digest("hex"), 604800, String(u._id));
-    res.cookie("access_token", access(String(u._id)), { ...cookies, maxAge: 900000 });
-    res.cookie("refresh_token", token, { ...cookies, maxAge: 604800000 });
+    if (await User.exists({ email })) return res.status(409).json({ message: "Account already exists. Use Google sign-in or sign in with your password." });
+    const u: any = await User.create({ email, passwordHash: await bcrypt.hash(password, 12), authProvider: "password" });
+    await issueSession(res, String(u._id));
     res.status(201).json({ user: userView(u) });
   } catch { res.status(500).json({ message: "Unable to create account" }); }
 });
@@ -157,28 +268,32 @@ app.post("/api/auth/register", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   const email = String(req.body.email || "").trim().toLowerCase(), password = String(req.body.password || "");
   const u: any = await User.findOne({ email });
-  if (!u || !(await bcrypt.compare(password, u.passwordHash))) return res.status(401).json({ message: "Invalid email or password" });
-  const token = refresh(String(u._id));
-  await redis.setEx("session:" + crypto.createHash("sha256").update(token).digest("hex"), 604800, String(u._id));
-  res.cookie("access_token", access(String(u._id)), { ...cookies, maxAge: 900000 });
-  res.cookie("refresh_token", token, { ...cookies, maxAge: 604800000 });
+  if (!u?.passwordHash || !(await bcrypt.compare(password, u.passwordHash))) return res.status(401).json({ message: "Invalid email or password" });
+  await issueSession(res, String(u._id));
   res.json({ user: userView(u) });
 });
 
 app.post("/api/auth/refresh", async (req, res) => {
   try {
-    const token = req.cookies.refresh_token; if (!token) throw Error();
+    const token = req.cookies.refresh_token;
+    if (!token) throw Error();
     const p: any = jwt.verify(token, env.JWT_SECRET);
     if (p.type !== "refresh" || !(await redis.get("session:" + crypto.createHash("sha256").update(token).digest("hex")))) throw Error();
-    res.cookie("access_token", access(p.sub), { ...cookies, maxAge: 900000 }); res.json({ ok: true });
+    res.cookie("access_token", access(p.sub), { ...cookies, maxAge: 900000 });
+    res.json({ ok: true });
   } catch { res.status(401).json({ message: "Refresh session expired" }); }
 });
+
 app.post("/api/auth/logout", async (req, res) => {
   const token = req.cookies.refresh_token;
   if (token) await redis.del("session:" + crypto.createHash("sha256").update(token).digest("hex"));
   res.clearCookie("access_token", cookies); res.clearCookie("refresh_token", cookies); res.status(204).end();
 });
-app.get("/api/auth/me", async (req, res) => { try { res.json({ user: userView(await auth(req)) }); } catch { res.status(401).json({ message: "Not authenticated" }); } });
+
+app.get("/api/auth/me", async (req, res) => {
+  try { res.json({ user: userView(await auth(req)) }); }
+  catch { res.status(401).json({ message: "Not authenticated" }); }
+});
 
 app.post("/api/whatsapp/connect", async (req, res) => {
   try {
@@ -186,12 +301,18 @@ app.post("/api/whatsapp/connect", async (req, res) => {
     let c: any = await connectionFor(String(user._id));
     if (!c) {
       const sessionName = "user_" + String(user._id);
-      try { await waha.createSession(sessionName); } catch (e: any) { if (!String(e.message).includes("already")) throw e; await waha.startSession(sessionName); }
+      try { await waha.createSession(sessionName); } catch (e: any) { if (!String(e.message).includes("already")) throw e; }
+      try { await waha.startSession(sessionName); } catch {}
       c = await WhatsappConnection.create({ userId: user._id, sessionName, status: "STARTING" });
       await recordActivation(String(user._id), c);
-    } else { try { await waha.startSession(c.sessionName); } catch {} }
+    } else {
+      try { await waha.startSession(c.sessionName); } catch {}
+    }
     const session: any = await waha.getSession(c.sessionName);
-    c.status = session.status || c.status; c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber; c.pushName = session.me?.pushName || c.pushName; await c.save();
+    c.status = session.status || c.status;
+    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
+    c.pushName = session.me?.pushName || c.pushName;
+    await c.save();
     res.json({ connection: c, session });
   } catch (e: any) { res.status(500).json({ message: e.message || "Unable to connect WhatsApp" }); }
 });
@@ -201,7 +322,10 @@ app.get("/api/whatsapp/status", async (req, res) => {
     const user: any = await auth(req), c: any = await connectionFor(String(user._id));
     if (!c) return res.json({ connected: false });
     const session: any = await waha.getSession(c.sessionName);
-    c.status = session.status || c.status; c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber; c.pushName = session.me?.pushName || c.pushName; await c.save();
+    c.status = session.status || c.status;
+    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
+    c.pushName = session.me?.pushName || c.pushName;
+    await c.save();
     res.json({ connected: session.status === "WORKING", connection: c, session });
   } catch (e: any) { res.status(401).json({ message: e.message || "Unable to read status" }); }
 });
@@ -234,14 +358,64 @@ app.post("/api/whatsapp/publish", async (req, res) => {
     if (session.status !== "WORKING") return res.status(409).json({ message: "WhatsApp session is not ready", status: session.status });
     const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl });
     await redis.lPush("solosync:publish", JSON.stringify({ publicationId: String(p._id) }));
-    res.status(202).json({ publication: { id: String(p._id), status: "queued", feePaise: env.MESSAGE_FEE_PAISE, billingEnabled: env.BILLING_ENABLED } });
+    res.status(202).json({ publication: { id: String(p._id), status: "queued", feePaise: env.MESSAGE_FEE_PAISE } });
   } catch (e: any) { res.status(500).json({ message: e.message || "Unable to queue message" }); }
+});
+
+app.get("/api/messages", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    const page = Math.max(1, Number(req.query.page || 1));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 25)));
+    const skip = (page - 1) * limit;
+    const [messages, total] = await Promise.all([
+      Publication.find({ userId: user._id }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Publication.countDocuments({ userId: user._id }),
+    ]);
+    res.json({ messages, page, limit, total, pages: Math.ceil(total / limit) });
+  } catch (e: any) { res.status(401).json({ message: e.message || "Unable to read messages" }); }
+});
+
+app.get("/api/dashboard", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [rows, recent, connection] = await Promise.all([
+      Publication.aggregate([
+        { $match: { userId: user._id } },
+        { $group: {
+          _id: null,
+          total: { $sum: 1 },
+          successful: { $sum: { $cond: [{ $eq: ["$status", "published"] }, 1, 0] } },
+          failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } },
+          queued: { $sum: { $cond: [{ $in: ["$status", ["queued", "publishing"]] }, 1, 0] } },
+        } },
+      ]),
+      Publication.countDocuments({ userId: user._id, createdAt: { $gte: since } }),
+      connectionFor(String(user._id)),
+    ]);
+    const s = rows[0] || { total: 0, successful: 0, failed: 0, queued: 0 };
+    res.json({
+      connection: connection ? {
+        status: connection.status, phoneNumber: connection.phoneNumber, pushName: connection.pushName,
+        connected: connection.status === "WORKING",
+      } : null,
+      stats: {
+        total: s.total, successful: s.successful, failed: s.failed, queued: s.queued,
+        successRate: s.total ? Number(((s.successful / s.total) * 100).toFixed(1)) : 0,
+        failureRate: s.total ? Number(((s.failed / s.total) * 100).toFixed(1)) : 0,
+        last24Hours: recent,
+      },
+    });
+  } catch (e: any) { res.status(401).json({ message: e.message || "Unable to read dashboard" }); }
 });
 
 app.get("/api/billing/summary", async (req, res) => {
   try {
-    const user: any = await auth(req), rows: any[] = await BillingLedger.find({ userId: user._id }).sort({ createdAt: -1 }).limit(100).lean();
-    const total = rows.reduce((s, r) => s + r.amountPaise, 0), messages = rows.filter(r => r.kind === "message").reduce((s, r) => s + r.units, 0);
+    const user: any = await auth(req);
+    const rows: any[] = await BillingLedger.find({ userId: user._id }).sort({ createdAt: -1 }).limit(100).lean();
+    const total = rows.reduce((s, r) => s + r.amountPaise, 0);
+    const messages = rows.filter(r => r.kind === "message").reduce((s, r) => s + r.units, 0);
     res.json({ billingEnabled: env.BILLING_ENABLED, activationFeePaise: env.ACTIVATION_FEE_PAISE, messageFeePaise: env.MESSAGE_FEE_PAISE, messageCount: messages, recordedAmountPaise: total, recordedAmountRupees: total / 100, entries: rows });
   } catch (e: any) { res.status(401).json({ message: e.message || "Unable to read billing" }); }
 });
