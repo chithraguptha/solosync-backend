@@ -10,6 +10,12 @@ import crypto from "crypto";
 import { createClient } from "redis";
 import { OAuth2Client } from "google-auth-library";
 import { WahaClient } from "./waha";
+import {
+  configureBilling, createOrder, Payment, Wallet, WalletTransaction,
+  verifyCheckoutSignature, verifyWebhookSignature, processCapturedPayment,
+  reserveMessageCredit, finalizeMessageCredit, releaseMessageCredit, creditWallet,
+} from "./billing";
+import { mountAdmin } from "./admin";
 
 const env = {
   JWT_SECRET: process.env.JWT_SECRET || "change-me",
@@ -25,10 +31,17 @@ const env = {
   BILLING_ENABLED: process.env.BILLING_ENABLED === "true",
   ACTIVATION_FEE_PAISE: Number(process.env.ACTIVATION_FEE_PAISE || 39900),
   MESSAGE_FEE_PAISE: Number(process.env.MESSAGE_FEE_PAISE || 10),
+  RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || "",
+  RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || "",
+  RAZORPAY_WEBHOOK_SECRET: process.env.RAZORPAY_WEBHOOK_SECRET || "",
+  RAZORPAY_CURRENCY: process.env.RAZORPAY_CURRENCY || "INR",
+  ADMIN_EMAIL: process.env.ADMIN_EMAIL || "",
+  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "",
 };
 
 if (env.NODE_ENV === "production" && env.JWT_SECRET === "change-me") throw Error("JWT_SECRET must be configured");
 if (env.NODE_ENV === "production" && !env.WAHA_API_KEY) throw Error("WAHA_API_KEY must be configured");
+if (env.BILLING_ENABLED && env.NODE_ENV === "production" && (!env.RAZORPAY_KEY_ID || !env.RAZORPAY_KEY_SECRET || !env.RAZORPAY_WEBHOOK_SECRET)) throw Error("Razorpay configuration is required when billing is enabled");
 
 const User = mongoose.model("User", new Schema(
   {
@@ -38,6 +51,7 @@ const User = mongoose.model("User", new Schema(
     name: String,
     avatarUrl: String,
     authProvider: { type: String, enum: ["password", "google", "both"], default: "password" },
+    billingStatus: { type: String, enum: ["PENDING_ACTIVATION", "ACTIVE", "SUSPENDED"], default: "ACTIVE" },
   },
   { timestamps: true },
 ));
@@ -94,6 +108,15 @@ const waha = new WahaClient({
   webhookHmacKey: env.WAHA_WEBHOOK_HMAC_KEY,
 });
 const google = new OAuth2Client(env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.GOOGLE_REDIRECT_URI);
+configureBilling({
+  enabled: env.BILLING_ENABLED,
+  keyId: env.RAZORPAY_KEY_ID,
+  keySecret: env.RAZORPAY_KEY_SECRET,
+  webhookSecret: env.RAZORPAY_WEBHOOK_SECRET,
+  currency: env.RAZORPAY_CURRENCY,
+  activationFeePaise: env.ACTIVATION_FEE_PAISE,
+  messageFeePaise: env.MESSAGE_FEE_PAISE,
+});
 
 type RawRequest = Request & { rawBody?: Buffer };
 const app = express();
@@ -110,7 +133,7 @@ const access = (id: string) => jwt.sign({ sub: id, type: "access" }, env.JWT_SEC
 const refresh = (id: string) => jwt.sign({ sub: id, type: "refresh", jti: crypto.randomUUID() }, env.JWT_SECRET, { expiresIn: "7d" });
 const userView = (u: any) => ({
   id: String(u._id), email: u.email, name: u.name || u.email.split("@")[0],
-  avatarUrl: u.avatarUrl || null, authProvider: u.authProvider, createdAt: u.createdAt,
+  avatarUrl: u.avatarUrl || null, authProvider: u.authProvider, billingStatus: u.billingStatus || "ACTIVE", createdAt: u.createdAt,
 });
 
 async function issueSession(res: express.Response, userId: string) {
@@ -136,11 +159,12 @@ async function recordActivation(userId: string, c: any) {
   if (c.activationRecorded) return;
   await BillingLedger.create({
     userId, kind: "activation", units: 1, amountPaise: env.ACTIVATION_FEE_PAISE,
-    status: env.BILLING_ENABLED ? "pending_charge" : "recorded",
-    note: env.BILLING_ENABLED ? "Payment provider integration pending" : "Test mode: payment disabled",
+    status: "recorded", note: env.BILLING_ENABLED ? "Razorpay activation payment captured" : "Local test mode",
   });
   c.activationRecorded = true;
+  c.status = c.status || "STARTING";
   await c.save();
+  await mongoose.model("User").findByIdAndUpdate(userId, { billingStatus: "ACTIVE" });
 }
 
 async function recordMessage(userId: string, publicationId: any) {
@@ -174,11 +198,13 @@ async function publish(publicationId: string) {
     p.publishedAt = new Date();
     p.error = undefined;
     await p.save();
+    await finalizeMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
     await recordMessage(String(p.userId), p._id);
   } catch (error: any) {
     p.status = p.attempts < 3 ? "queued" : "failed";
     p.error = String(error?.message || error);
     await p.save();
+    if (p.status === "failed") await releaseMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
     throw error;
   }
 }
@@ -298,13 +324,15 @@ app.get("/api/auth/me", async (req, res) => {
 app.post("/api/whatsapp/connect", async (req, res) => {
   try {
     const user: any = await auth(req);
+    if (user.billingStatus === "SUSPENDED") return res.status(403).json({ message: "Account is suspended" });
+    if (env.BILLING_ENABLED && user.billingStatus !== "ACTIVE") return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
     let c: any = await connectionFor(String(user._id));
     if (!c) {
       const sessionName = "user_" + String(user._id);
       try { await waha.createSession(sessionName); } catch (e: any) { if (!String(e.message).includes("already")) throw e; }
       try { await waha.startSession(sessionName); } catch {}
       c = await WhatsappConnection.create({ userId: user._id, sessionName, status: "STARTING" });
-      await recordActivation(String(user._id), c);
+      if (!env.BILLING_ENABLED) await recordActivation(String(user._id), c);
     } else {
       try { await waha.startSession(c.sessionName); } catch {}
     }
@@ -357,7 +385,15 @@ app.post("/api/whatsapp/publish", async (req, res) => {
     const session: any = await waha.getSession(c.sessionName);
     if (session.status !== "WORKING") return res.status(409).json({ message: "WhatsApp session is not ready", status: session.status });
     const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl });
-    await redis.lPush("solosync:publish", JSON.stringify({ publicationId: String(p._id) }));
+    const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+    if (!reserved) { await p.deleteOne(); return res.status(402).json({ message: "Insufficient wallet balance. Top up your wallet to send messages.", code: "INSUFFICIENT_BALANCE" }); }
+    try {
+      await redis.lPush("solosync:publish", JSON.stringify({ publicationId: String(p._id) }));
+    } catch (error) {
+      await releaseMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+      await p.deleteOne();
+      throw error;
+    }
     res.status(202).json({ publication: { id: String(p._id), status: "queued", feePaise: env.MESSAGE_FEE_PAISE } });
   } catch (e: any) { res.status(500).json({ message: e.message || "Unable to queue message" }); }
 });
@@ -419,6 +455,96 @@ app.get("/api/billing/summary", async (req, res) => {
     res.json({ billingEnabled: env.BILLING_ENABLED, activationFeePaise: env.ACTIVATION_FEE_PAISE, messageFeePaise: env.MESSAGE_FEE_PAISE, messageCount: messages, recordedAmountPaise: total, recordedAmountRupees: total / 100, entries: rows });
   } catch (e: any) { res.status(401).json({ message: e.message || "Unable to read billing" }); }
 });
+
+
+// Billing / Razorpay
+app.get("/api/billing/config", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    const wallet: any = await Wallet.findOne({ userId: user._id }).lean();
+    res.json({ enabled: env.BILLING_ENABLED, keyId: env.RAZORPAY_KEY_ID || null, activationFeePaise: env.ACTIVATION_FEE_PAISE, messageFeePaise: env.MESSAGE_FEE_PAISE, billingStatus: user.billingStatus || "ACTIVE", wallet: wallet ? { balancePaise: wallet.balancePaise, reservedPaise: wallet.reservedPaise } : { balancePaise: 0, reservedPaise: 0 } });
+  } catch (e:any) { res.status(401).json({ message: e.message || "Unable to read billing config" }); }
+});
+
+app.post("/api/billing/activation/order", async (req, res) => {
+  try {
+    const user:any = await auth(req);
+    if (!env.BILLING_ENABLED) { user.billingStatus = "ACTIVE"; await user.save(); return res.json({ disabled: true, billingStatus: "ACTIVE" }); }
+    if (user.billingStatus === "ACTIVE") return res.json({ alreadyActive: true, billingStatus: "ACTIVE" });
+    const existing:any = await Payment.findOne({ userId:user._id, type:"activation", status:"created" }).sort({createdAt:-1});
+    const order = existing ? { id: existing.razorpayOrderId, amount: existing.amountPaise, currency: existing.currency } : await createOrder("activation", String(user._id), env.ACTIVATION_FEE_PAISE, env.RAZORPAY_CURRENCY);
+    res.json({ keyId: env.RAZORPAY_KEY_ID, order, amountPaise: env.ACTIVATION_FEE_PAISE, currency: env.RAZORPAY_CURRENCY });
+  } catch(e:any) { res.status(500).json({ message:e.message || "Unable to create activation order" }); }
+});
+
+app.post("/api/billing/activation/verify", async (req,res) => {
+  try {
+    const user:any=await auth(req);
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature }=req.body||{};
+    const p:any=await Payment.findOne({userId:user._id,razorpayOrderId:razorpay_order_id,type:"activation"});
+    if(!p || p.amountPaise!==env.ACTIVATION_FEE_PAISE) return res.status(400).json({message:"Invalid activation order"});
+    if(!verifyCheckoutSignature(razorpay_order_id,razorpay_payment_id,razorpay_signature,env.RAZORPAY_KEY_SECRET)) return res.status(400).json({message:"Invalid payment signature"});
+    const captured:any=await processCapturedPayment(razorpay_payment_id);
+    captured.razorpaySignature=razorpay_signature; await captured.save();
+    user.billingStatus="ACTIVE"; await user.save();
+    res.json({ok:true,billingStatus:"ACTIVE"});
+  }catch(e:any){res.status(400).json({message:e.message||"Payment verification failed"});}
+});
+
+app.post("/api/billing/wallet/order", async (req,res) => {
+  try {
+    const user:any=await auth(req);
+    if(!env.BILLING_ENABLED) return res.json({disabled:true});
+    const amountPaise=Math.round(Number(req.body.amountPaise||0));
+    if(!Number.isInteger(amountPaise) || amountPaise<10000 || amountPaise>100000000) return res.status(400).json({message:"Top-up must be between ₹100 and ₹1,000,000"});
+    const order=await createOrder("wallet_topup",String(user._id),amountPaise,env.RAZORPAY_CURRENCY);
+    res.json({keyId:env.RAZORPAY_KEY_ID,order,amountPaise,currency:env.RAZORPAY_CURRENCY});
+  }catch(e:any){res.status(400).json({message:e.message||"Unable to create wallet order"});}
+});
+
+app.post("/api/billing/wallet/verify", async(req,res)=>{
+  try{
+    const user:any=await auth(req); const {razorpay_order_id,razorpay_payment_id,razorpay_signature}=req.body||{};
+    const p:any=await Payment.findOne({userId:user._id,razorpayOrderId:razorpay_order_id,type:"wallet_topup"});
+    if(!p) return res.status(400).json({message:"Invalid wallet order"});
+    if(!verifyCheckoutSignature(razorpay_order_id,razorpay_payment_id,razorpay_signature,env.RAZORPAY_KEY_SECRET)) return res.status(400).json({message:"Invalid payment signature"});
+    const captured:any=await processCapturedPayment(razorpay_payment_id);
+    captured.razorpaySignature=razorpay_signature; await captured.save();
+    if(captured.status==="captured") await creditWallet(String(user._id),p.amountPaise,String(p._id));
+    const wallet:any=await Wallet.findOne({userId:user._id}).lean();
+    res.json({ok:true,wallet:{balancePaise:wallet?.balancePaise||0,reservedPaise:wallet?.reservedPaise||0}});
+  }catch(e:any){res.status(400).json({message:e.message||"Wallet payment verification failed"});}
+});
+
+app.get("/api/billing/wallet", async(req,res)=>{
+  try{const user:any=await auth(req);const wallet:any=await Wallet.findOne({userId:user._id}).lean();const transactions=await WalletTransaction.find({userId:user._id}).sort({createdAt:-1}).limit(100).lean();res.json({wallet:{balancePaise:wallet?.balancePaise||0,reservedPaise:wallet?.reservedPaise||0},transactions});}
+  catch(e:any){res.status(401).json({message:e.message||"Unable to read wallet"});}
+});
+
+app.post("/webhooks/razorpay", async(req,res)=>{
+  const signature=req.header("X-Razorpay-Signature")||"";
+  const raw=(req as RawRequest).rawBody?.toString("utf8")||"";
+  if(!env.RAZORPAY_WEBHOOK_SECRET || !verifyWebhookSignature(raw,signature,env.RAZORPAY_WEBHOOK_SECRET)) return res.status(401).json({message:"Invalid Razorpay webhook signature"});
+  try{
+    const eventId=req.header("x-razorpay-event-id")||crypto.createHash("sha256").update(raw).digest("hex");
+    const inserted=await RazorpayWebhookEvent.create({eventId,event:req.body?.event||"unknown"}).catch((e:any)=>e?.code===11000?null:Promise.reject(e));
+    if(!inserted) return res.status(204).end();
+    const event=req.body?.event;
+    const payment=req.body?.payload?.payment?.entity;
+    if(payment && (event==="payment.captured" || event==="order.paid")){
+      const p:any=await markPaymentCaptured(payment);
+      if(p.type==="activation"){await mongoose.model("User").findByIdAndUpdate(p.userId,{billingStatus:"ACTIVE"});await BillingLedger.create({userId:p.userId,kind:"activation",units:1,amountPaise:p.amountPaise,status:"recorded",note:"Razorpay webhook captured"});}
+      if(p.type==="wallet_topup"){
+        const already=await WalletTransaction.exists({type:"topup",referenceId:String(p._id)});
+        if(!already) await creditWallet(String(p.userId),p.amountPaise,String(p._id));
+      }
+    }
+    if(payment && event==="payment.failed") await Payment.findOneAndUpdate({razorpayOrderId:payment.order_id},{status:"failed",razorpayPaymentId:payment.id});
+    res.status(204).end();
+  }catch(e:any){res.status(500).json({message:e.message||"Webhook processing failed"});}
+});
+
+mountAdmin(app, { email: env.ADMIN_EMAIL, password: env.ADMIN_PASSWORD });
 
 app.post("/webhooks/waha", async (req, res) => {
   const raw = (req as RawRequest).rawBody?.toString("utf8") || JSON.stringify(req.body);
