@@ -189,9 +189,13 @@ async function publish(publicationId: string) {
 
   try {
     let result: any;
-    if (p.kind === "image" && p.mediaUrl) result = await waha.sendImage(c.sessionName, p.chatId, p.mediaUrl, p.text);
-    else if (p.kind === "video" && p.mediaUrl) result = await waha.sendVideo(c.sessionName, p.chatId, p.mediaUrl, p.text);
-    else result = await waha.sendText(c.sessionName, p.chatId, p.text || "");
+    const resolvedChatId = await waha.resolveChatId(c.sessionName, p.chatId);
+    if (p.kind === "image" && p.mediaUrl) result = await waha.sendImage(c.sessionName, resolvedChatId, p.mediaUrl, p.text);
+    else if (p.kind === "video" && p.mediaUrl) result = await waha.sendVideo(c.sessionName, resolvedChatId, p.mediaUrl, p.text);
+    else result = await waha.sendText(c.sessionName, resolvedChatId, p.text || "");
+    // Persist the resolved @lid/@c.us value so retries use the same WhatsApp
+    // identity and operators can diagnose recipient resolution.
+    p.chatId = resolvedChatId;
 
     p.status = "published";
     p.providerMessageId = result?.id || result?.key?.id;
