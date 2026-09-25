@@ -262,6 +262,28 @@ async function recoverStuckPublications() {
   }).select({ _id: 1, attempts: 1, chatId: 1 }).lean();
 
   for (const publication of stuck) {
+    if (publication.attempts >= 3) {
+      const updated: any = await Publication.findOneAndUpdate(
+        { _id: publication._id, status: "publishing", updatedAt: { $lt: cutoff } },
+        { $set: { status: "failed", error: "Publishing job became stale after maximum retry attempts" } },
+        { new: true },
+      );
+      if (!updated) continue;
+      await releaseMessageCredit(
+        String(updated.userId),
+        env.MESSAGE_FEE_PAISE,
+        String(updated._id),
+        env.BILLING_ENABLED,
+      );
+      console.error(JSON.stringify({
+        event: "publication.recovery_failed",
+        publicationId: String(updated._id),
+        attempts: updated.attempts,
+        reason: "maximum attempts reached",
+      }));
+      continue;
+    }
+
     const updated: any = await Publication.findOneAndUpdate(
       { _id: publication._id, status: "publishing", updatedAt: { $lt: cutoff } },
       { $set: { status: "queued", error: "Recovered stale publishing job after worker timeout/restart" } },
