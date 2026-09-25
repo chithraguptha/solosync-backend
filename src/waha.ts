@@ -1,0 +1,114 @@
+import crypto from "crypto";
+
+export type WahaConfig = {
+  baseUrl: string;
+  apiKey: string;
+  webhookUrl?: string;
+  webhookHmacKey?: string;
+};
+
+export class WahaClient {
+  constructor(private readonly config: WahaConfig) {}
+
+  private async request(path: string, init: RequestInit = {}) {
+    const response = await fetch(this.config.baseUrl.replace(/\/$/, "") + path, {
+      ...init,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-Api-Key": this.config.apiKey,
+        ...(init.headers || {}),
+      },
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`WAHA ${response.status}: ${body.slice(0, 500)}`);
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    return contentType.includes("application/json")
+      ? response.json()
+      : response;
+  }
+
+  async createSession(name: string) {
+    return this.request("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        config: {
+          webhooks: this.config.webhookUrl
+            ? [{
+                url: this.config.webhookUrl,
+                events: ["session.status", "message.any"],
+                ...(this.config.webhookHmacKey
+                  ? { hmac: { key: this.config.webhookHmacKey } }
+                  : {}),
+              }]
+            : [],
+        },
+      }),
+    });
+  }
+
+  async startSession(name: string) {
+    return this.request(`/api/sessions/${encodeURIComponent(name)}/start`, { method: "POST" });
+  }
+
+  async getSession(name: string) {
+    return this.request(`/api/sessions/${encodeURIComponent(name)}`);
+  }
+
+  async getMe(name: string) {
+    return this.request(`/api/sessions/${encodeURIComponent(name)}/me`);
+  }
+
+  async getQr(name: string) {
+    return this.request(`/api/${encodeURIComponent(name)}/auth/qr`, { method: "POST" });
+  }
+
+  async getChannels(name: string) {
+    return this.request(`/api/${encodeURIComponent(name)}/channels`);
+  }
+
+  async sendText(session: string, chatId: string, text: string) {
+    return this.request("/api/sendText", {
+      method: "POST",
+      body: JSON.stringify({ session, chatId, text }),
+    });
+  }
+
+  async sendImage(session: string, chatId: string, url: string, caption?: string) {
+    return this.request("/api/sendImage", {
+      method: "POST",
+      body: JSON.stringify({
+        session,
+        chatId,
+        file: { url, mimetype: "image/jpeg", filename: "solosync-image.jpg" },
+        ...(caption ? { caption } : {}),
+      }),
+    });
+  }
+
+  async sendVideo(session: string, chatId: string, url: string, caption?: string) {
+    return this.request("/api/sendVideo", {
+      method: "POST",
+      body: JSON.stringify({
+        session,
+        chatId,
+        file: { url, mimetype: "video/mp4", filename: "solosync-video.mp4" },
+        ...(caption ? { caption } : {}),
+      }),
+    });
+  }
+
+  verifyWebhook(rawBody: string, signature?: string) {
+    if (!this.config.webhookHmacKey || !signature) return true;
+    const digest = crypto
+      .createHmac("sha512", this.config.webhookHmacKey)
+      .update(rawBody)
+      .digest("hex");
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+  }
+}
