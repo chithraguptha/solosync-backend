@@ -2,97 +2,121 @@
 
 Node.js + Express + TypeScript + MongoDB + Redis backend for SoloSync.
 
-## MVP features
+## Included
 
-- Email/password authentication with HTTP-only cookies.
-- One WhatsApp account session per SoloSync user through self-hosted WAHA.
-- QR-based WhatsApp session connection.
-- WhatsApp session status and channel discovery.
-- Text, image and video publication jobs through a Redis-backed worker.
-- Publication history and provider message IDs.
-- Billing ledger prepared for:
-  - **₹399 activation fee** per first WhatsApp account activation.
-  - **₹0.10 per successfully published message**.
-- Payments are intentionally disabled for the current test phase. Set `BILLING_ENABLED=false`.
-- /health and /ready endpoints.
+- Email/password and Google OAuth authentication.
+- QR-based WhatsApp account pairing through private WAHA.
+- Redis-backed text/image/video publication worker.
+- Publication history and dashboard analytics.
+- Razorpay activation payment (₹399) and prepaid wallet top-ups.
+- ₹0.10/message internal wallet accounting.
+- Server-side Razorpay Checkout verification and webhook HMAC validation.
+- ActiveAdmin-style internal operations dashboard at `/admin`.
+- Complete local Docker stack with MongoDB, Redis, WAHA, API and frontend.
 
-WAHA sessions represent the connected WhatsApp account. SoloSync never asks the user for their WhatsApp password; the user pairs the account through WAHA's QR flow. WAHA supports persistent sessions and multiple sessions in one deployment, so production storage must survive restarts.
+## Local: run the whole website
 
-## Local
+Clone the frontend beside the backend repository:
 
-    cp .env.example .env
-    npm install
-    npm run dev
+```bash
+git clone -b feat/production-mvp https://github.com/solosynctech/backend.git solosync-backend
+git clone -b feat/production-mvp https://github.com/solosynctech/frontend.git solosync-frontend
+cd solosync-backend
+docker compose -f docker-compose.local.yml up --build
+```
 
-Start MongoDB, Redis and WAHA separately. The default WAHA URL is `http://localhost:3000`.
+Open:
+- Website: http://localhost:5173
+- API: http://localhost:4000/health
+- Admin: http://localhost:4000/admin
+- Admin username: `admin@solosync.local`
+- Admin password: `admin-local-change-me`
 
-## WAHA
+The local stack deliberately runs with `BILLING_ENABLED=false`, so you can create an account, pair WhatsApp, send test messages and inspect the ledger without moving money. Change the local admin password before sharing the environment.
 
-Run a protected WAHA instance and configure:
+To stop it:
+```bash
+docker compose -f docker-compose.local.yml down
+```
 
-    WAHA_URL=http://localhost:3000
-    WAHA_API_KEY=...
-    WAHA_WEBHOOK_URL=https://api.example.com/webhooks/waha
-    WAHA_WEBHOOK_HMAC_KEY=...
+To remove local MongoDB/WAHA state too:
+```bash
+docker compose -f docker-compose.local.yml down -v
+```
 
-Do not expose the WAHA API directly to the public internet. Keep it on a private network and let only the backend reach it.
+### Local WhatsApp test
+1. Open the website.
+2. Create an email/password account.
+3. Click **Link WhatsApp**.
+4. Open WhatsApp on your phone → Linked devices → Link a device.
+5. Scan the QR shown by SoloSync.
+6. Wait for **Connected / WORKING**.
+7. Enter a recipient chat ID and send a message.
+8. Inspect the publication and billing records in `/admin`.
 
-## WhatsApp flow
+WAHA remains internal to the Docker network and is not exposed on the host.
 
-1. User creates a SoloSync account.
-2. User selects **Connect WhatsApp**.
-3. Backend creates a deterministic WAHA session for that user.
-4. Frontend polls status and fetches the QR while the session is in `SCAN_QR_CODE`.
-5. User scans the QR from WhatsApp.
-6. WAHA reports `WORKING`.
-7. SoloSync can list channels and queue publications.
-8. A Redis worker sends the message through WAHA.
-9. Only successful sends create a message usage ledger entry.
+## Razorpay setup
 
-## API
+Razorpay uses separate Test and Live modes. Keep Test Mode enabled until the full flow is verified. Generate API keys in the Razorpay Dashboard and keep the secret only on the backend. The backend creates Orders; the frontend receives only the public key and order metadata.
 
-Authentication:
+Backend environment:
+```env
+BILLING_ENABLED=true
+RAZORPAY_KEY_ID=rzp_test_xxx
+RAZORPAY_KEY_SECRET=...
+RAZORPAY_WEBHOOK_SECRET=...
+RAZORPAY_CURRENCY=INR
+ACTIVATION_FEE_PAISE=39900
+MESSAGE_FEE_PAISE=10
+```
 
-- POST /api/auth/register
-- POST /api/auth/login
-- POST /api/auth/refresh
-- POST /api/auth/logout
-- GET /api/auth/me
+Configure the Test Mode webhook endpoint as `https://api.solosync.live/webhooks/razorpay`.
 
-WhatsApp:
+Subscribe at minimum to `payment.captured`, `payment.failed` and `order.paid`. The webhook is validated against the raw request body using HMAC-SHA256. Checkout signatures are also verified server-side.
 
-- POST /api/whatsapp/connect
-- GET /api/whatsapp/status
-- GET /api/whatsapp/qr
-- GET /api/whatsapp/channels
-- POST /api/whatsapp/publish
+For local webhook testing, use a public HTTPS staging/tunnel that Razorpay accepts rather than assuming localhost delivery.
 
-Billing:
+## Billing flow
+### Activation
+```text
+Dashboard
+  -> POST /api/billing/activation/order
+  -> Razorpay Checkout
+  -> POST /api/billing/activation/verify
+  -> Razorpay payment fetch + signature verification
+  -> ACTIVE account
+  -> WhatsApp connection allowed
+```
 
-- GET /api/billing/summary
+The webhook independently reconciles captured payments and is idempotent.
 
-Webhook:
+### Wallet
+Use Razorpay for wallet top-ups, not for every message.
 
-- POST /webhooks/waha
+Example: `₹100 = 10,000 paise = 1,000 messages at ₹0.10/message`
 
-## Billing model
+Before a paid message is queued, the backend atomically reserves ₹0.10. On successful WAHA delivery it commits the usage; on a final failure it releases the reservation.
 
-All amounts are stored as paise to avoid floating-point money calculations.
+## Admin dashboard
+The internal dashboard provides:
+- overview metrics
+- users and authentication providers
+- WhatsApp connection status
+- publication history and failures
+- Razorpay payment records
+- wallet balances and reservations
+- billing ledger
 
-`39900 paise = ₹399`
+Protect `/admin` with a strong password and do not expose it publicly without an additional access-control layer.
 
-`10 paise = ₹0.10`
-
-The ledger is already populated in test mode, but no payment gateway is called. A payment provider can later consume activation and message ledger entries without changing the WhatsApp publishing API.
-
-## Production hardening before charging users
-
-- Integrate a payment provider and verify webhooks server-side.
-- Make activation payment idempotent.
-- Add prepaid wallet/credit balance or an explicit postpaid policy.
-- Add invoice/tax records as required.
-- Add refresh-token rotation and reuse detection.
-- Add structured logs, metrics and alerting.
-- Persist WAHA session storage and backups.
-- Keep WAHA private and protected by API key/firewall.
-- Define messaging/acceptable-use limits and account-disconnection handling.
+## Production hardening still required
+- pin every npm dependency and commit a lockfile
+- add automated unit/E2E tests for payment verification and wallet idempotency
+- use stronger admin authentication/authorization than shared Basic Auth
+- add refresh-token rotation and reuse detection
+- add structured logs, metrics and alerting
+- persist and back up WAHA session storage
+- validate Razorpay webhook IP policy according to current Razorpay guidance
+- configure production CORS, secrets and HTTPS
+- define messaging/acceptable-use limits and account-disconnection handling
