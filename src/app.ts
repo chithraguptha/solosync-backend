@@ -487,6 +487,7 @@ app.post("/api/billing/activation/verify", async (req,res) => {
     const captured:any=await processCapturedPayment(razorpay_payment_id);
     captured.razorpaySignature=razorpay_signature; await captured.save();
     user.billingStatus="ACTIVE"; await user.save();
+    if (!(await BillingLedger.exists({ userId:user._id, kind:"activation" }))) await BillingLedger.create({userId:user._id,kind:"activation",units:1,amountPaise:p.amountPaise,status:"recorded",note:"Razorpay Checkout verified"});
     res.json({ok:true,billingStatus:"ACTIVE"});
   }catch(e:any){res.status(400).json({message:e.message||"Payment verification failed"});}
 });
@@ -533,7 +534,10 @@ app.post("/webhooks/razorpay", async(req,res)=>{
     const payment=req.body?.payload?.payment?.entity;
     if(payment && (event==="payment.captured" || event==="order.paid")){
       const p:any=await markPaymentCaptured(payment);
-      if(p.type==="activation"){await mongoose.model("User").findByIdAndUpdate(p.userId,{billingStatus:"ACTIVE"});await BillingLedger.create({userId:p.userId,kind:"activation",units:1,amountPaise:p.amountPaise,status:"recorded",note:"Razorpay webhook captured"});}
+      if(p.type==="activation"){
+        await mongoose.model("User").findByIdAndUpdate(p.userId,{billingStatus:"ACTIVE"});
+        if (!(await BillingLedger.exists({userId:p.userId,kind:"activation"}))) await BillingLedger.create({userId:p.userId,kind:"activation",units:1,amountPaise:p.amountPaise,status:"recorded",note:"Razorpay webhook captured"});
+      }
       if(p.type==="wallet_topup"){
         const already=await WalletTransaction.exists({type:"topup",referenceId:String(p._id)});
         if(!already) await creditWallet(String(p.userId),p.amountPaise,String(p._id));
