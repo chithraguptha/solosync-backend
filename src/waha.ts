@@ -56,7 +56,7 @@ export class WahaClient {
           webhooks: this.config.webhookUrl
             ? [{
                 url: this.config.webhookUrl,
-                events: ["session.status", "message.any"],
+                events: ["session.status", "message.any", "message.ack"],
                 ...(this.config.webhookHmacKey
                   ? { hmac: { key: this.config.webhookHmacKey } }
                   : {}),
@@ -71,6 +71,22 @@ export class WahaClient {
     return this.request(`/api/sessions/${encodeURIComponent(name)}/start`, { method: "POST" });
   }
 
+  async updateSessionWebhooks(name: string) {
+    if (!this.config.webhookUrl) return;
+    return this.request(`/api/sessions/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        name,
+        config: {
+          webhooks: [{
+            url: this.config.webhookUrl,
+            events: ["session.status", "message.any", "message.ack"],
+            ...(this.config.webhookHmacKey ? { hmac: { key: this.config.webhookHmacKey } } : {}),
+          }],
+        },
+      }),
+    });
+  }
   async getSession(name: string) {
     return this.request(`/api/sessions/${encodeURIComponent(name)}`);
   }
@@ -87,6 +103,11 @@ export class WahaClient {
     return this.request(`/api/${encodeURIComponent(name)}/channels`);
   }
 
+  async getChatMessages(session: string, chatId: string, limit = 100) {
+    return this.request(
+      `/api/${encodeURIComponent(session)}/chats/${encodeURIComponent(chatId)}/messages?limit=${Math.min(100, Math.max(1, limit))}&downloadMedia=false`,
+    );
+  }
   async resolveChatId(session: string, chatId: string) {
     const value = String(chatId || "").trim();
     if (!value) throw new Error("Recipient is required");
