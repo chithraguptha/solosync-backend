@@ -81,6 +81,7 @@ const Publication = mongoose.model("Publication", new Schema(
     text: String,
     mediaUrl: String,
     status: { type: String, enum: ["queued", "publishing", "published", "failed"], default: "queued", index: true },
+    deliveryStatus: { type: String, enum: ["UNKNOWN", "PENDING", "SERVER", "DEVICE", "READ", "PLAYED", "ERROR"], default: "UNKNOWN" },
     attempts: { type: Number, default: 0 },
     providerMessageId: String,
     error: String,
@@ -181,6 +182,49 @@ async function recordMessage(userId: string, publicationId: any) {
   });
 }
 
+function ackStatus(ackName?: string, ack?: number) {
+  const value = String(ackName || "").toUpperCase();
+  if (value === "ERROR" || ack === -1) return "ERROR";
+  if (value === "PENDING" || ack === 0) return "PENDING";
+  if (value === "SERVER" || ack === 1) return "SERVER";
+  if (value === "DEVICE" || ack === 2) return "DEVICE";
+  if (value === "READ" || ack === 3) return "READ";
+  if (value === "PLAYED" || ack === 4) return "PLAYED";
+  return "UNKNOWN";
+}
+
+async function markPublicationPublished(p: any, providerMessageId: string, deliveryStatus = "UNKNOWN", publishedAt?: Date) {
+  p.status = "published";
+  p.providerMessageId = providerMessageId || p.providerMessageId;
+  p.deliveryStatus = deliveryStatus;
+  p.publishedAt = publishedAt || p.publishedAt || new Date();
+  p.error = undefined;
+  await p.save();
+  await finalizeMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+  await recordMessage(String(p.userId), p._id);
+}
+
+async function reconcilePublicationWithWaha(p: any, c: any) {
+  try {
+    const resolvedChatId = await waha.resolveChatId(c.sessionName, p.chatId);
+    const messages: any[] = await waha.getChatMessages(c.sessionName, resolvedChatId, 100);
+    const createdAt = new Date(p.createdAt).getTime();
+    const candidates = messages
+      .filter((m: any) => m?.fromMe === true && (!p.text || m.body === p.text))
+      .map((m: any) => ({ message: m, distance: Math.abs((Number(m.timestamp || 0) * 1000) - createdAt) }))
+      .filter((x: any) => x.distance <= 30 * 60 * 1000)
+      .sort((a: any, b: any) => a.distance - b.distance);
+    const match = candidates[0]?.message;
+    if (!match?.id) return false;
+    p.chatId = resolvedChatId;
+    await markPublicationPublished(p, String(match.id), ackStatus(match.ackName, match.ack), match.timestamp ? new Date(Number(match.timestamp) * 1000) : new Date());
+    console.warn(JSON.stringify({ event: "publication.reconciled", publicationId: String(p._id), providerMessageId: String(match.id), deliveryStatus: ackStatus(match.ackName, match.ack) }));
+    return true;
+  } catch (error: any) {
+    console.warn(JSON.stringify({ event: "publication.reconciliation_failed", publicationId: String(p._id), error: String(error?.message || error) }));
+    return false;
+  }
+}
 async function publish(publicationId: string) {
   // A worker crash or a hanging WAHA request must never leave a publication
   // permanently stuck in "publishing". WAHA requests have a hard timeout and
@@ -223,21 +267,20 @@ async function publish(publicationId: string) {
     // identity and operators can diagnose recipient resolution.
     p.chatId = resolvedChatId;
 
-    p.status = "published";
-    p.providerMessageId = result?.id || result?.key?.id;
+    const providerMessageId = result?.id || result?.key?.id;
     console.log(JSON.stringify({
       event: "publication.published",
       publicationId: String(p._id),
-      providerMessageId: p.providerMessageId || null,
+      providerMessageId: providerMessageId || null,
       chatId: resolvedChatId,
       attempt: p.attempts,
     }));
-    p.publishedAt = new Date();
-    p.error = undefined;
-    await p.save();
-    await finalizeMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
-    await recordMessage(String(p.userId), p._id);
+    p.chatId = resolvedChatId;
+    await markPublicationPublished(p, providerMessageId, "PENDING");
   } catch (error: any) {
+    // WAHA may accept a message and then time out the HTTP request. Reconcile
+    // WhatsApp history before retrying so delivered messages are not duplicated.
+    if (await reconcilePublicationWithWaha(p, c)) return;
     p.status = p.attempts < 3 ? "queued" : "failed";
     p.error = String(error?.message || error);
     await p.save();
@@ -262,6 +305,10 @@ async function recoverStuckPublications() {
   }).select({ _id: 1, attempts: 1, chatId: 1 }).lean();
 
   for (const publication of stuck) {
+    const fullPublication: any = await Publication.findById(publication._id);
+    const connection: any = fullPublication ? await WhatsappConnection.findById(fullPublication.connectionId) : null;
+    if (fullPublication && connection && await reconcilePublicationWithWaha(fullPublication, connection)) continue;
+
     if (publication.attempts >= 3) {
       const updated: any = await Publication.findOneAndUpdate(
         { _id: publication._id, status: "publishing", updatedAt: { $lt: cutoff } },
@@ -306,11 +353,23 @@ async function recoverStuckPublications() {
   return stuck.length;
 }
 
+async function reconcileRecentPublications() {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const publications: any[] = await Publication.find({
+    status: { $in: ["publishing", "failed"] },
+    createdAt: { $gte: since },
+  }).sort({ createdAt: -1 }).limit(100);
+  for (const publication of publications) {
+    const connection: any = await WhatsappConnection.findById(publication.connectionId);
+    if (connection) await reconcilePublicationWithWaha(publication, connection);
+  }
+}
 async function worker() {
   await workerRedis.connect();
 
-  // Recover jobs that were left in "publishing" by a process restart or an
-  // older version of the worker before entering the blocking queue loop.
+  // Reconcile recent uncertain records before retrying anything. WhatsApp
+  // history is authoritative when the WAHA HTTP request timed out.
+  await reconcileRecentPublications();
   await recoverStuckPublications();
 
   const recoveryTimer = setInterval(() => {
@@ -677,10 +736,56 @@ app.post("/webhooks/waha", async (req, res) => {
   const raw = (req as RawRequest).rawBody?.toString("utf8") || JSON.stringify(req.body);
   if (!waha.verifyWebhook(raw, req.header("X-Webhook-Hmac") || undefined)) return res.status(401).json({ message: "Invalid webhook signature" });
   try {
-    if (req.body?.event === "session.status") {
-      const c: any = await WhatsappConnection.findOne({ sessionName: req.body.session });
-      if (c) { c.status = req.body.payload?.status || c.status; await c.save(); }
+    const event = req.body?.event;
+    const sessionName = String(req.body?.session || "");
+    const payload = req.body?.payload || {};
+
+    if (event === "session.status") {
+      const c: any = await WhatsappConnection.findOne({ sessionName });
+      if (c) { c.status = payload?.status || c.status; await c.save(); }
     }
+
+    if (event === "message.any" && payload?.fromMe === true && payload?.id) {
+      const publication: any = await Publication.findOne({ providerMessageId: String(payload.id) });
+      if (publication) {
+        await markPublicationPublished(publication, String(payload.id), ackStatus(payload.ackName, payload.ack), payload.timestamp ? new Date(Number(payload.timestamp) * 1000) : new Date());
+      } else if (sessionName && payload.body) {
+        const connection: any = await WhatsappConnection.findOne({ sessionName });
+        if (connection) {
+          const candidate: any = await Publication.findOne({
+            connectionId: connection._id,
+            status: { $in: ["queued", "publishing"] },
+            text: String(payload.body),
+            createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) },
+          }).sort({ createdAt: -1 });
+          if (candidate) {
+            candidate.chatId = String(payload.to || payload.from || candidate.chatId);
+            await markPublicationPublished(candidate, String(payload.id), ackStatus(payload.ackName, payload.ack));
+          }
+        }
+      }
+    }
+
+    if (event === "message.ack" && payload?.fromMe === true && payload?.id) {
+      const publication: any = await Publication.findOne({ providerMessageId: String(payload.id) });
+      if (publication) {
+        publication.deliveryStatus = ackStatus(payload.ackName, payload.ack);
+        if (publication.deliveryStatus === "ERROR") {
+          publication.status = "failed";
+          publication.error = "WAHA message acknowledgement reported ERROR";
+          await publication.save();
+          await releaseMessageCredit(String(publication.userId), env.MESSAGE_FEE_PAISE, String(publication._id), env.BILLING_ENABLED);
+        } else {
+          publication.status = "published";
+          publication.publishedAt = publication.publishedAt || new Date();
+          publication.error = undefined;
+          await publication.save();
+          await finalizeMessageCredit(String(publication.userId), env.MESSAGE_FEE_PAISE, String(publication._id), env.BILLING_ENABLED);
+          await recordMessage(String(publication.userId), publication._id);
+        }
+      }
+    }
+
     res.status(204).end();
   } catch { res.status(400).json({ message: "Invalid webhook" }); }
 });
