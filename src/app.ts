@@ -384,7 +384,7 @@ app.post("/api/whatsapp/publish", async (req, res) => {
     if (!["text", "image", "video"].includes(kind)) return res.status(400).json({ message: "Unsupported message kind" });
     const session: any = await waha.getSession(c.sessionName);
     if (session.status !== "WORKING") return res.status(409).json({ message: "WhatsApp session is not ready", status: session.status });
-    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl });
+    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl } as any);
     const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
     if (!reserved) { await p.deleteOne(); return res.status(402).json({ message: "Insufficient wallet balance. Top up your wallet to send messages.", code: "INSUFFICIENT_BALANCE" }); }
     try {
