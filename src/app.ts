@@ -25,6 +25,9 @@ const env = {
   WAHA_API_KEY: process.env.WAHA_API_KEY || "",
   WAHA_WEBHOOK_URL: process.env.WAHA_WEBHOOK_URL || "",
   WAHA_WEBHOOK_HMAC_KEY: process.env.WAHA_WEBHOOK_HMAC_KEY || "",
+  WAHA_REQUEST_TIMEOUT_MS: Number(process.env.WAHA_REQUEST_TIMEOUT_MS || 30000),
+  PUBLISHING_STALE_MS: Number(process.env.PUBLISHING_STALE_MS || 5 * 60 * 1000),
+  PUBLISH_RECOVERY_INTERVAL_MS: Number(process.env.PUBLISH_RECOVERY_INTERVAL_MS || 60 * 1000),
   GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID || "",
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET || "",
   GOOGLE_REDIRECT_URI: process.env.GOOGLE_REDIRECT_URI || "http://localhost:4000/api/auth/google/callback",
@@ -106,6 +109,7 @@ const waha = new WahaClient({
   apiKey: env.WAHA_API_KEY,
   webhookUrl: env.WAHA_WEBHOOK_URL,
   webhookHmacKey: env.WAHA_WEBHOOK_HMAC_KEY,
+  requestTimeoutMs: env.WAHA_REQUEST_TIMEOUT_MS,
 });
 const google = new OAuth2Client(env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.GOOGLE_REDIRECT_URI);
 configureBilling({
@@ -178,6 +182,9 @@ async function recordMessage(userId: string, publicationId: any) {
 }
 
 async function publish(publicationId: string) {
+  // A worker crash or a hanging WAHA request must never leave a publication
+  // permanently stuck in "publishing". WAHA requests have a hard timeout and
+  // stale publications are recovered by the worker loop below.
   const p: any = await Publication.findById(publicationId);
   if (!p || p.status === "published") return;
   const c: any = await WhatsappConnection.findById(p.connectionId);
@@ -187,9 +194,28 @@ async function publish(publicationId: string) {
   p.attempts += 1;
   await p.save();
 
+  console.log(JSON.stringify({
+    event: "publication.publishing",
+    publicationId: String(p._id),
+    session: c.sessionName,
+    attempt: p.attempts,
+    chatId: p.chatId,
+  }));
+
   try {
     let result: any;
+    console.log(JSON.stringify({
+      event: "publication.resolving_recipient",
+      publicationId: String(p._id),
+      session: c.sessionName,
+      chatId: p.chatId,
+    }));
     const resolvedChatId = await waha.resolveChatId(c.sessionName, p.chatId);
+    console.log(JSON.stringify({
+      event: "publication.recipient_resolved",
+      publicationId: String(p._id),
+      chatId: resolvedChatId,
+    }));
     if (p.kind === "image" && p.mediaUrl) result = await waha.sendImage(c.sessionName, resolvedChatId, p.mediaUrl, p.text);
     else if (p.kind === "video" && p.mediaUrl) result = await waha.sendVideo(c.sessionName, resolvedChatId, p.mediaUrl, p.text);
     else result = await waha.sendText(c.sessionName, resolvedChatId, p.text || "");
@@ -199,6 +225,13 @@ async function publish(publicationId: string) {
 
     p.status = "published";
     p.providerMessageId = result?.id || result?.key?.id;
+    console.log(JSON.stringify({
+      event: "publication.published",
+      publicationId: String(p._id),
+      providerMessageId: p.providerMessageId || null,
+      chatId: resolvedChatId,
+      attempt: p.attempts,
+    }));
     p.publishedAt = new Date();
     p.error = undefined;
     await p.save();
@@ -208,20 +241,84 @@ async function publish(publicationId: string) {
     p.status = p.attempts < 3 ? "queued" : "failed";
     p.error = String(error?.message || error);
     await p.save();
+
+    console.error(JSON.stringify({
+      event: "publication.failed_attempt",
+      publicationId: String(p._id),
+      attempt: p.attempts,
+      nextStatus: p.status,
+      error: p.error,
+    }));
     if (p.status === "failed") await releaseMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
     throw error;
   }
 }
 
+async function recoverStuckPublications() {
+  const cutoff = new Date(Date.now() - env.PUBLISHING_STALE_MS);
+  const stuck: any[] = await Publication.find({
+    status: "publishing",
+    updatedAt: { $lt: cutoff },
+  }).select({ _id: 1, attempts: 1, chatId: 1 }).lean();
+
+  for (const publication of stuck) {
+    const updated: any = await Publication.findOneAndUpdate(
+      { _id: publication._id, status: "publishing", updatedAt: { $lt: cutoff } },
+      { $set: { status: "queued", error: "Recovered stale publishing job after worker timeout/restart" } },
+      { new: true },
+    );
+    if (!updated) continue;
+
+    await workerRedis.lPush(
+      "solosync:publish",
+      JSON.stringify({ publicationId: String(publication._id) }),
+    );
+
+    console.warn(JSON.stringify({
+      event: "publication.recovered",
+      publicationId: String(publication._id),
+      attempts: publication.attempts,
+    }));
+  }
+
+  return stuck.length;
+}
+
 async function worker() {
   await workerRedis.connect();
+
+  // Recover jobs that were left in "publishing" by a process restart or an
+  // older version of the worker before entering the blocking queue loop.
+  await recoverStuckPublications();
+
+  const recoveryTimer = setInterval(() => {
+    recoverStuckPublications().catch((error) => {
+      console.error(JSON.stringify({
+        event: "publication.recovery_failed",
+        error: String(error?.message || error),
+      }));
+    });
+  }, env.PUBLISH_RECOVERY_INTERVAL_MS);
+  recoveryTimer.unref?.();
+
+  console.log(JSON.stringify({
+    event: "publication.worker_started",
+    requestTimeoutMs: env.WAHA_REQUEST_TIMEOUT_MS,
+    stalePublishingMs: env.PUBLISHING_STALE_MS,
+  }));
+
   for (;;) {
     const item = await workerRedis.brPop("solosync:publish", 0);
     if (!item) continue;
-    try { await publish(JSON.parse(item.element).publicationId); }
-    catch (e: any) {
-      const p: any = await Publication.findById(JSON.parse(item.element).publicationId);
-      if (p && p.status === "queued" && p.attempts < 3) await workerRedis.lPush("solosync:publish", item.element);
+
+    const payload = JSON.parse(item.element);
+    try {
+      await publish(payload.publicationId);
+    } catch (e: any) {
+      const p: any = await Publication.findById(payload.publicationId);
+      if (p && p.status === "queued" && p.attempts < 3) {
+        await workerRedis.lPush("solosync:publish", item.element);
+      }
     }
   }
 }
