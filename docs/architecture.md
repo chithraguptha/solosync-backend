@@ -14,6 +14,7 @@ flowchart LR
   W -->|status webhook| API
   RP[Razorpay] -->|payment webhooks| API
   API --> LEDGER[(Billing Ledger / Wallet)]
+  OPS[Internal Admin] -->|Basic Auth| API
 ```
 
 ## Authentication
@@ -181,6 +182,24 @@ Payment and webhook processing must be idempotent.
 - Store money as integer paise, never floating point.
 
 Razorpay explicitly recommends server-side signature validation and webhook HMAC validation.
+
+## Internal operations dashboard
+
+The backend exposes an ActiveAdmin-style operations console at `/admin`. It provides overview metrics plus searchable-style resource tables for users, WhatsApp connections, publications, Razorpay payments, wallets and billing ledger records. The current implementation uses the existing Express backend rather than introducing a second Rails service, so the local stack stays small.
+
+## Local development architecture
+
+```mermaid
+flowchart LR
+  B[Browser] --> FE[Frontend :5173]
+  FE --> API[Express :4000]
+  API --> M[(MongoDB)]
+  API --> R[(Redis)]
+  API --> W[WAHA :3000 internal]
+  OPS[Admin Browser] --> API
+```
+
+Run `docker compose -f docker-compose.local.yml up --build` from the backend repository after cloning the frontend beside it. Local billing is disabled by default, so WhatsApp and message flows can be tested without Razorpay.
 
 ## Production flow
 
