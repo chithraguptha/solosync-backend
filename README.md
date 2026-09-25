@@ -120,3 +120,9 @@ Protect `/admin` with a strong password and do not expose it publicly without an
 - validate Razorpay webhook IP policy according to current Razorpay guidance
 - configure production CORS, secrets and HTTPS
 - define messaging/acceptable-use limits and account-disconnection handling
+
+## Troubleshooting: `WAHA 500: No LID for user`
+
+If a publication fails with `No LID for user`, this is a WAHA/WhatsApp Web recipient identity issue, not a MongoDB or Redis failure. SoloSync now resolves direct phone numbers through WAHA `check-exists` immediately before sending and stores the returned `@lid` or `@c.us` chat ID. The local stack pins WAHA `2026.9.1` instead of floating `latest`. If an older deployment is still running, recreate the WAHA container with the pinned image and keep the existing session volume. Then retry the message. WAHA's documentation supports both `@c.us` and `@lid` chat IDs and recommends `check-exists` for resolving phone numbers. citeturn3search0turn3search1
+
+If the existing session remains unhealthy after the WAHA upgrade, reconnect that WhatsApp session once rather than repeatedly retrying the same publication.
