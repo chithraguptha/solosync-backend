@@ -11,8 +11,8 @@ import { createClient } from "redis";
 import { OAuth2Client } from "google-auth-library";
 import { WahaClient } from "./waha";
 import {
-  configureBilling, createOrder, Payment, Wallet, WalletTransaction,
-  verifyCheckoutSignature, verifyWebhookSignature, processCapturedPayment,
+  configureBilling, createOrder, Payment, Wallet, WalletTransaction, RazorpayWebhookEvent,
+  verifyCheckoutSignature, verifyWebhookSignature, processCapturedPayment, markPaymentCaptured,
   reserveMessageCredit, finalizeMessageCredit, releaseMessageCredit, creditWallet,
 } from "./billing";
 import { mountAdmin } from "./admin";
@@ -51,7 +51,7 @@ const User = mongoose.model("User", new Schema(
     name: String,
     avatarUrl: String,
     authProvider: { type: String, enum: ["password", "google", "both"], default: "password" },
-    billingStatus: { type: String, enum: ["PENDING_ACTIVATION", "ACTIVE", "SUSPENDED"], default: "ACTIVE" },
+    billingStatus: { type: String, enum: ["PENDING_ACTIVATION", "ACTIVE", "SUSPENDED"], default: () => env.BILLING_ENABLED ? "PENDING_ACTIVATION" : "ACTIVE" },
   },
   { timestamps: true },
 ));
@@ -172,7 +172,7 @@ async function recordMessage(userId: string, publicationId: any) {
   if (exists) return;
   await BillingLedger.create({
     userId, publicationId, kind: "message", units: 1, amountPaise: env.MESSAGE_FEE_PAISE,
-    status: env.BILLING_ENABLED ? "pending_charge" : "recorded",
+    status: "recorded",
     note: env.BILLING_ENABLED ? "Payment provider integration pending" : "Test mode: payment disabled",
   });
 }
