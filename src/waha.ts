@@ -65,7 +65,7 @@ export class WahaClient {
   }
 
   async getQr(name: string) {
-    return this.request(`/api/${encodeURIComponent(name)}/auth/qr`, { method: "POST" });
+    return this.request(`/api/${encodeURIComponent(name)}/auth/qr?format=image`, { method: "GET", headers: { Accept: "application/json" } });
   }
 
   async getChannels(name: string) {
