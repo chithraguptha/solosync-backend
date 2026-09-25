@@ -518,7 +518,14 @@ app.post("/api/whatsapp/connect", async (req, res) => {
     } else {
       try { await waha.startSession(c.sessionName); } catch {}
     }
-    const session: any = await waha.getSession(c.sessionName);
+    let session: any = await waha.getSession(c.sessionName);
+    const webhookEvents = session?.config?.webhooks?.flatMap((hook: any) => hook?.events || []) || [];
+    if (env.WAHA_WEBHOOK_URL && !webhookEvents.includes("message.ack")) {
+      // Existing WAHA sessions may have been created before ack webhooks were
+      // enabled. WAHA updates the session configuration and restarts it once.
+      await waha.updateSessionWebhooks(c.sessionName);
+      session = await waha.getSession(c.sessionName);
+    }
     c.status = session.status || c.status;
     c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
     c.pushName = session.me?.pushName || c.pushName;
