@@ -87,7 +87,7 @@ export async function createOrder(type: "activation" | "wallet_topup", userId: s
   return order;
 }
 
-export async function markPaymentCaptured(payment: any) {
+export export async function markPaymentCaptured(payment: any) {
   const p: any = await Payment.findOne({ razorpayOrderId: payment.order_id });
   if (!p) throw new Error("Payment order not found");
   if (Number(payment.amount) !== p.amountPaise || payment.currency !== p.currency) throw new Error("Payment amount mismatch");
