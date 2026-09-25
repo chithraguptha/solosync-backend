@@ -3,6 +3,7 @@ import crypto from "crypto";
 export type WahaConfig = {
   baseUrl: string;
   apiKey: string;
+  requestTimeoutMs?: number;
   webhookUrl?: string;
   webhookHmacKey?: string;
 };
@@ -11,9 +12,15 @@ export class WahaClient {
   constructor(private readonly config: WahaConfig) {}
 
   private async request(path: string, init: RequestInit = {}) {
-    const response = await fetch(this.config.baseUrl.replace(/\/$/, "") + path, {
-      ...init,
-      headers: {
+    const controller = new AbortController();
+    const timeoutMs = Math.max(1000, this.config.requestTimeoutMs || 30000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(this.config.baseUrl.replace(/\/$/, "") + path, {
+        ...init,
+        signal: controller.signal,
+        headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
         "X-Api-Key": this.config.apiKey,
@@ -21,15 +28,23 @@ export class WahaClient {
       },
     });
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`WAHA ${response.status}: ${body.slice(0, 500)}`);
-    }
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`WAHA ${response.status}: ${body.slice(0, 500)}`);
+      }
 
-    const contentType = response.headers.get("content-type") || "";
-    return contentType.includes("application/json")
-      ? response.json()
-      : response;
+      const contentType = response.headers.get("content-type") || "";
+      return contentType.includes("application/json")
+        ? response.json()
+        : response;
+    } catch (error: any) {
+      if (error?.name === "AbortError") {
+        throw new Error(`WAHA request timed out after ${timeoutMs}ms: ${path}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async createSession(name: string) {
