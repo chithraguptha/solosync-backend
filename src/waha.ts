@@ -72,6 +72,30 @@ export class WahaClient {
     return this.request(`/api/${encodeURIComponent(name)}/channels`);
   }
 
+  async resolveChatId(session: string, chatId: string) {
+    const value = String(chatId || "").trim();
+    if (!value) throw new Error("Recipient is required");
+
+    // Groups, channels and already-resolved LIDs must be passed through unchanged.
+    if (value.endsWith("@g.us") || value.endsWith("@newsletter") || value.endsWith("@lid")) return value;
+
+    // WAHA/WhatsApp can migrate a contact from @c.us to @lid. Resolve the
+    // current chat id immediately before sending instead of guessing it.
+    const phone = value.replace(/^\+/, "").replace(/@c\.us$/, "").replace(/\D/g, "");
+    if (!phone) throw new Error("Recipient must be a WhatsApp phone number or chat ID");
+
+    const result: any = await this.request(
+      `/api/contacts/check-exists?phone=${encodeURIComponent(phone)}&session=${encodeURIComponent(session)}`,
+      { method: "GET" },
+    );
+
+    if (!result?.numberExists || !result?.chatId) {
+      throw new Error("The recipient number is not registered on WhatsApp");
+    }
+
+    return String(result.chatId);
+  }
+
   async sendText(session: string, chatId: string, text: string) {
     return this.request("/api/sendText", {
       method: "POST",
