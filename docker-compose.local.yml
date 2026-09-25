@@ -1,0 +1,59 @@
+services:
+  mongo:
+    image: mongo:8
+    restart: unless-stopped
+    volumes:
+      - solosync_mongo:/data/db
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+  waha:
+    image: devlikeapro/waha:latest
+    restart: unless-stopped
+    environment:
+      WAHA_API_KEY: local-waha-key
+      WAHA_PRINT_QR: "false"
+      WAHA_DASHBOARD_ENABLED: "false"
+      WHATSAPP_RESTART_ALL_SESSIONS: "true"
+      WAHA_WORKER_ID: local-waha
+    volumes:
+      - solosync_waha:/app/.sessions
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      MONGODB_URI: mongodb://mongo:27017/solosync
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: local-development-secret-change-me
+      FRONTEND_ORIGIN: http://localhost:5173
+      NODE_ENV: development
+      WAHA_URL: http://waha:3000
+      WAHA_API_KEY: local-waha-key
+      WAHA_WEBHOOK_URL: http://api:4000/webhooks/waha
+      WAHA_WEBHOOK_HMAC_KEY: local-waha-webhook-secret
+      BILLING_ENABLED: "false"
+      ACTIVATION_FEE_PAISE: 39900
+      MESSAGE_FEE_PAISE: 10
+      RAZORPAY_CURRENCY: INR
+      ADMIN_EMAIL: admin@solosync.local
+      ADMIN_PASSWORD: admin-local-change-me
+    depends_on:
+      - mongo
+      - redis
+      - waha
+  frontend:
+    build:
+      context: ../frontend
+      args:
+        VITE_API_URL: http://localhost:4000
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+volumes:
+  solosync_mongo:
+  solosync_waha:
