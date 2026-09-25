@@ -66,6 +66,7 @@ function razorpay() {
 }
 
 export function verifyCheckoutSignature(orderId: string, paymentId: string, signature: string, secret: string) {
+  if (!orderId || !paymentId || !signature || !secret) return false;
   const expected = crypto.createHmac("sha256", secret).update(orderId + "|" + paymentId).digest("hex");
   if (expected.length !== signature.length) return false;
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
