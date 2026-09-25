@@ -8,7 +8,7 @@ services:
     image: redis:8-alpine
     restart: unless-stopped
   waha:
-    image: devlikeapro/waha:latest
+    image: devlikeapro/waha:2026.9.1
     restart: unless-stopped
     environment:
       WAHA_API_KEY: local-waha-key
