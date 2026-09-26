@@ -41,6 +41,7 @@ const env = {
   RAZORPAY_WEBHOOK_SECRET: process.env.RAZORPAY_WEBHOOK_SECRET || "",
   RAZORPAY_CURRENCY: process.env.RAZORPAY_CURRENCY || "INR",
   API_BASE_URL: process.env.API_BASE_URL || "https://api.solosync.live",
+  COOKIE_DOMAIN: process.env.COOKIE_DOMAIN || "",
   ADMIN_EMAIL: process.env.ADMIN_EMAIL || "",
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "",
 };
@@ -140,7 +141,7 @@ app.use("/api/whatsapp", rateLimit({ windowMs: 60_000, max: 60 }));
 app.use("/v1", rateLimit({ windowMs: 60_000, max: 120 }));
 app.use("/api/developer", rateLimit({ windowMs: 60_000, max: 30 }));
 
-const cookies = { httpOnly: true, secure: env.NODE_ENV === "production", sameSite: "lax" as const, path: "/" };
+const cookies = { httpOnly: true, secure: env.NODE_ENV === "production", sameSite: "lax" as const, path: "/", ...(env.COOKIE_DOMAIN ? { domain: env.COOKIE_DOMAIN } : {}) };
 const access = (id: string) => jwt.sign({ sub: id, type: "access" }, env.JWT_SECRET, { expiresIn: "15m" });
 const refresh = (id: string) => jwt.sign({ sub: id, type: "refresh", jti: crypto.randomUUID() }, env.JWT_SECRET, { expiresIn: "7d" });
 const userView = (u: any) => ({
