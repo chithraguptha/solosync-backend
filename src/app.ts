@@ -173,6 +173,7 @@ async function developerAuth(req: Request, requiredScope: any) {
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   const key: any = await authenticateApiKey(token);
   if (!key) throw Object.assign(new Error("Invalid or revoked API key"), { statusCode: 401 });
+  if (env.NODE_ENV === "production" && key.environment === "test") throw Object.assign(new Error("Test API keys cannot be used in production"), { statusCode: 401 });
   if (!hasApiKeyScope(key, requiredScope)) throw Object.assign(new Error("API key does not have the required scope"), { statusCode: 403 });
   const user: any = await User.findById(key.userId);
   if (!user) throw Object.assign(new Error("Account not found"), { statusCode: 401 });
