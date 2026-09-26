@@ -229,3 +229,31 @@ flowchart TD
 ## WhatsApp recipient resolution
 
 Before sending to a direct phone number, the publisher resolves the number through WAHA `GET /api/contacts/check-exists`. WAHA can return either a regular `@c.us` chat ID or a migrated `@lid` chat ID; SoloSync persists the resolved ID on the publication before calling `sendText`, `sendImage`, or `sendVideo`. This avoids assuming that every WhatsApp user can still be addressed only by `@c.us`. The WAHA image is pinned rather than floating on `latest`.
+
+
+## Developer platform architecture
+
+The developer workspace sits on the existing authenticated dashboard and exposes a separate versioned public API.
+
+```text
+Developer
+   |
+   +--> Dashboard session (HTTP-only cookie)
+   |      +--> Overview / Messages / Wallet / Account
+   |      +--> API Keys
+   |      +--> API Docs
+   |      +--> API Playground
+   |
+   +--> Public API (/v1)
+          |
+          +--> Authorization: Bearer ss_live_...
+          +--> Scoped API key lookup (SHA-256 hash)
+          +--> Account / Usage
+          +--> Connection / QR
+          +--> Messages
+          +--> Existing Redis -> WAHA publication worker
+```
+
+API key plaintext is returned only when a key is created or rotated. The database stores only the key hash plus display metadata such as prefix, last four characters, scopes, creation time and last-use time.
+
+The developer API intentionally uses the same message publication pipeline as the dashboard so queueing, wallet reservation, WAHA recipient resolution, delivery reconciliation and webhook-driven delivery status remain consistent across both interfaces.
