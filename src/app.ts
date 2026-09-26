@@ -16,6 +16,8 @@ import {
   reserveMessageCredit, finalizeMessageCredit, releaseMessageCredit, creditWallet,
 } from "./billing";
 import { mountAdmin } from "./admin";
+import { openapi } from "./openapi";
+import { API_KEY_SCOPES, authenticateApiKey, createApiKey, hasApiKeyScope, listApiKeys, publicApiKeyView, revokeApiKey, rotateApiKey } from "./apiKeys";
 
 const env = {
   JWT_SECRET: process.env.JWT_SECRET || "change-me",
@@ -38,6 +40,7 @@ const env = {
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || "",
   RAZORPAY_WEBHOOK_SECRET: process.env.RAZORPAY_WEBHOOK_SECRET || "",
   RAZORPAY_CURRENCY: process.env.RAZORPAY_CURRENCY || "INR",
+  API_BASE_URL: process.env.API_BASE_URL || "https://api.solosync.live",
   ADMIN_EMAIL: process.env.ADMIN_EMAIL || "",
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "",
 };
@@ -132,6 +135,7 @@ app.use(express.json({ limit: "1mb", verify: (req, _res, buf) => { (req as RawRe
 app.use(cookieParser());
 app.use("/api/auth", rateLimit({ windowMs: 60_000, max: 30 }));
 app.use("/api/whatsapp", rateLimit({ windowMs: 60_000, max: 60 }));
+app.use("/v1", rateLimit({ windowMs: 60_000, max: 120 }));
 
 const cookies = { httpOnly: true, secure: env.NODE_ENV === "production", sameSite: "lax" as const, path: "/" };
 const access = (id: string) => jwt.sign({ sub: id, type: "access" }, env.JWT_SECRET, { expiresIn: "15m" });
@@ -159,6 +163,23 @@ async function auth(req: Request) {
 }
 
 const connectionFor = (id: string) => WhatsappConnection.findOne({ userId: id });
+
+async function developerAuth(req: Request, requiredScope: any) {
+  const header = String(req.header("authorization") || "");
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  const key: any = await authenticateApiKey(token);
+  if (!key) throw Object.assign(new Error("Invalid or revoked API key"), { statusCode: 401 });
+  if (!hasApiKeyScope(key, requiredScope)) throw Object.assign(new Error("API key does not have the required scope"), { statusCode: 403 });
+  const user: any = await User.findById(key.userId);
+  if (!user) throw Object.assign(new Error("Account not found"), { statusCode: 401 });
+  if (user.billingStatus === "SUSPENDED") throw Object.assign(new Error("Account is suspended"), { statusCode: 403 });
+  return { key, user };
+}
+
+function developerError(res: express.Response, error: any) {
+  const status = Number(error?.statusCode || 500);
+  return res.status(status).json({ error: { message: error?.message || "Request failed" } });
+}
 
 async function recordActivation(userId: string, c: any) {
   if (c.activationRecorded) return;
@@ -645,6 +666,169 @@ app.get("/api/billing/summary", async (req, res) => {
   } catch (e: any) { res.status(401).json({ message: e.message || "Unable to read billing" }); }
 });
 
+
+// Developer dashboard and public API
+app.get("/api/developer/api-keys", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    res.json({ keys: await listApiKeys(String(user._id)), scopes: API_KEY_SCOPES });
+  } catch (e: any) { res.status(401).json({ message: e.message || "Unable to list API keys" }); }
+});
+
+app.post("/api/developer/api-keys", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    const name = String(req.body?.name || "").trim();
+    const environment = req.body?.environment === "test" ? "test" : "live";
+    const scopes = Array.isArray(req.body?.scopes) ? req.body.scopes.map(String) : [...API_KEY_SCOPES];
+    const result = await createApiKey(String(user._id), name, scopes, environment);
+    res.status(201).json({ ...result, warning: "This secret is shown once. Store it securely; it cannot be recovered later." });
+  } catch (e: any) { res.status(400).json({ message: e.message || "Unable to create API key" }); }
+});
+
+app.post("/api/developer/api-keys/:id/rotate", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    const result = await rotateApiKey(String(user._id), String(req.params.id));
+    res.json({ ...result, warning: "The old key has been revoked. Store the new secret securely; it cannot be recovered later." });
+  } catch (e: any) { res.status(400).json({ message: e.message || "Unable to rotate API key" }); }
+});
+
+app.delete("/api/developer/api-keys/:id", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    res.json({ key: await revokeApiKey(String(user._id), String(req.params.id)) });
+  } catch (e: any) { res.status(400).json({ message: e.message || "Unable to revoke API key" }); }
+});
+
+app.get("/openapi.json", (_req, res) => res.json(openapi));
+
+app.get("/v1/account", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "account:read");
+    const wallet: any = await Wallet.findOne({ userId: user._id }).lean();
+    res.json({
+      account: userView(user),
+      billing: {
+        enabled: env.BILLING_ENABLED,
+        status: user.billingStatus || "ACTIVE",
+        activationFeePaise: env.ACTIVATION_FEE_PAISE,
+        messageFeePaise: env.MESSAGE_FEE_PAISE,
+        wallet: { balancePaise: wallet?.balancePaise || 0, reservedPaise: wallet?.reservedPaise || 0 },
+      },
+    });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.get("/v1/connection", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:read");
+    const c: any = await connectionFor(String(user._id));
+    if (!c) return res.json({ connected: false, status: "NOT_CONNECTED", connection: null });
+    const session: any = await waha.getSession(c.sessionName);
+    c.status = session.status || c.status;
+    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
+    c.pushName = session.me?.pushName || c.pushName;
+    await c.save();
+    res.json({ connected: session.status === "WORKING", status: session.status, connection: { phoneNumber: c.phoneNumber || null, pushName: c.pushName || null, sessionName: c.sessionName } });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.post("/v1/connection", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:manage");
+    if (env.BILLING_ENABLED && user.billingStatus !== "ACTIVE") return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
+    let c: any = await connectionFor(String(user._id));
+    if (!c) {
+      const sessionName = "user_" + String(user._id);
+      try { await waha.createSession(sessionName); } catch (e: any) { if (!String(e.message).includes("already")) throw e; }
+      try { await waha.startSession(sessionName); } catch {}
+      c = await WhatsappConnection.create({ userId: user._id, sessionName, status: "STARTING" });
+      if (!env.BILLING_ENABLED) await recordActivation(String(user._id), c);
+    } else {
+      try { await waha.startSession(c.sessionName); } catch {}
+    }
+    let session: any = await waha.getSession(c.sessionName);
+    const webhookEvents = session?.config?.webhooks?.flatMap((hook: any) => hook?.events || []) || [];
+    if (env.WAHA_WEBHOOK_URL && !webhookEvents.includes("message.ack")) {
+      await waha.updateSessionWebhooks(c.sessionName);
+      session = await waha.getSession(c.sessionName);
+    }
+    c.status = session.status || c.status;
+    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
+    c.pushName = session.me?.pushName || c.pushName;
+    await c.save();
+    let qr: any = null;
+    if (session.status === "SCAN_QR_CODE") {
+      try { qr = await waha.getQr(c.sessionName); } catch {}
+    }
+    res.json({ connected: session.status === "WORKING", status: session.status, connection: { phoneNumber: c.phoneNumber || null, pushName: c.pushName || null, sessionName: c.sessionName }, qr });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.get("/v1/connection/qr", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:manage");
+    const c: any = await connectionFor(String(user._id));
+    if (!c) return res.status(404).json({ error: { message: "Connect WhatsApp first" } });
+    res.json(await waha.getQr(c.sessionName));
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.get("/v1/messages", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "messages:read");
+    const page = Math.max(1, Number(req.query.page || 1));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 25)));
+    const skip = (page - 1) * limit;
+    const [messages, total] = await Promise.all([
+      Publication.find({ userId: user._id }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Publication.countDocuments({ userId: user._id }),
+    ]);
+    res.json({ messages, page, limit, total, pages: Math.ceil(total / limit) });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.post("/v1/messages", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "messages:send");
+    const c: any = await connectionFor(String(user._id));
+    if (!c) return res.status(409).json({ error: { code: "NOT_CONNECTED", message: "Connect WhatsApp first" } });
+    const chatId = String(req.body?.chatId || "").trim();
+    const text = String(req.body?.text || "");
+    const kind = String(req.body?.kind || "text");
+    const mediaUrl = req.body?.mediaUrl ? String(req.body.mediaUrl) : undefined;
+    if (!chatId || (!text && !mediaUrl)) return res.status(400).json({ error: { message: "chatId and text/media are required" } });
+    if (!["text", "image", "video"].includes(kind)) return res.status(400).json({ error: { message: "Unsupported message kind" } });
+    const session: any = await waha.getSession(c.sessionName);
+    if (session.status !== "WORKING") return res.status(409).json({ error: { code: "WHATSAPP_NOT_READY", message: "WhatsApp session is not ready", status: session.status } });
+    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl } as any);
+    const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+    if (!reserved) { await p.deleteOne(); return res.status(402).json({ error: { code: "INSUFFICIENT_BALANCE", message: "Insufficient wallet balance" } }); }
+    try {
+      await redis.lPush("solosync:publish", JSON.stringify({ publicationId: String(p._id) }));
+    } catch (error) {
+      await releaseMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+      await p.deleteOne();
+      throw error;
+    }
+    res.status(202).json({ id: String(p._id), status: "queued", feePaise: env.MESSAGE_FEE_PAISE });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.get("/v1/usage", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "account:read");
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const [total, successful, failed, queued] = await Promise.all([
+      Publication.countDocuments({ userId: user._id }),
+      Publication.countDocuments({ userId: user._id, status: "published" }),
+      Publication.countDocuments({ userId: user._id, status: "failed" }),
+      Publication.countDocuments({ userId: user._id, status: { $in: ["queued", "publishing"] } }),
+    ]);
+    res.json({ period: { from: since.toISOString(), to: new Date().toISOString() }, total, successful, failed, queued });
+  } catch (e: any) { developerError(res, e); }
+});
 
 // Billing / Razorpay
 app.get("/api/billing/config", async (req, res) => {
