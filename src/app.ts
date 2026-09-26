@@ -70,6 +70,8 @@ const WhatsappConnection = mongoose.model("WhatsappConnection", new Schema(
     status: { type: String, default: "STOPPED" },
     phoneNumber: String,
     pushName: String,
+    error: String,
+    lastErrorAt: Date,
     activationRecorded: { type: Boolean, default: false },
   },
   { timestamps: true },
@@ -534,11 +536,16 @@ app.post("/api/whatsapp/connect", async (req, res) => {
     if (!c) {
       const sessionName = "user_" + String(user._id);
       try { await waha.createSession(sessionName); } catch (e: any) { if (!String(e.message).includes("already")) throw e; }
-      try { await waha.startSession(sessionName); } catch {}
+      try { await waha.startSession(sessionName); } catch (e: any) { throw Error("WAHA could not start the session: " + String(e.message || e)); }
       c = await WhatsappConnection.create({ userId: user._id, sessionName, status: "STARTING" });
       if (!env.BILLING_ENABLED) await recordActivation(String(user._id), c);
     } else {
-      try { await waha.startSession(c.sessionName); } catch {}
+      let current: any;
+      try { current = await waha.getSession(c.sessionName); } catch { current = null; }
+      if (current?.status === "FAILED") {
+        try { await waha.stopSession(c.sessionName); } catch {}
+      }
+      try { await waha.startSession(c.sessionName); } catch (e: any) { throw Error("WAHA could not restart the session: " + String(e.message || e)); }
     }
     let session: any = await waha.getSession(c.sessionName);
     const webhookEvents = session?.config?.webhooks?.flatMap((hook: any) => hook?.events || []) || [];
@@ -551,22 +558,26 @@ app.post("/api/whatsapp/connect", async (req, res) => {
     c.status = session.status || c.status;
     c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
     c.pushName = session.me?.pushName || c.pushName;
+    c.error = session.status === "FAILED" ? String(session.error || session.failureReason || session.reason || "WAHA session failed") : undefined;
+    c.lastErrorAt = session.status === "FAILED" ? new Date() : undefined;
     await c.save();
-    res.json({ connection: c, session });
+    res.json({ connection: c, session, error: c.error || null });
   } catch (e: any) { res.status(500).json({ message: e.message || "Unable to connect WhatsApp" }); }
 });
 
 app.get("/api/whatsapp/status", async (req, res) => {
   try {
     const user: any = await auth(req), c: any = await connectionFor(String(user._id));
-    if (!c) return res.json({ connected: false });
+    if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
     const session: any = await waha.getSession(c.sessionName);
     c.status = session.status || c.status;
     c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
     c.pushName = session.me?.pushName || c.pushName;
+    c.error = session.status === "FAILED" ? String(session.error || session.failureReason || session.reason || c.error || "WAHA session failed") : undefined;
+    c.lastErrorAt = session.status === "FAILED" ? new Date() : c.lastErrorAt;
     await c.save();
-    res.json({ connected: session.status === "WORKING", connection: c, session });
-  } catch (e: any) { res.status(401).json({ message: e.message || "Unable to read status" }); }
+    res.json({ connected: session.status === "WORKING", status: session.status, connection: c, session, error: c.error || null });
+  } catch (e: any) { res.status(502).json({ message: e.message || "Unable to read WhatsApp status" }); }
 });
 
 app.get("/api/whatsapp/qr", async (req, res) => {
@@ -893,6 +904,19 @@ app.post("/api/billing/wallet/verify", async(req,res)=>{
     const wallet:any=await Wallet.findOne({userId:user._id}).lean();
     res.json({ok:true,wallet:{balancePaise:wallet?.balancePaise||0,reservedPaise:wallet?.reservedPaise||0}});
   }catch(e:any){res.status(400).json({message:e.message||"Wallet payment verification failed"});}
+});
+
+app.post("/api/billing/wallet/test-credit", async(req,res)=>{
+  try {
+    if (env.BILLING_ENABLED || env.NODE_ENV === "production") return res.status(404).json({message:"Test wallet credit is disabled"});
+    const user:any=await auth(req);
+    const amountPaise=Math.round(Number(req.body?.amountPaise || 0));
+    if(!Number.isInteger(amountPaise) || amountPaise < 100 || amountPaise > 1000000) return res.status(400).json({message:"Test credit must be between ₹1 and ₹10,000"});
+    const referenceId="local_test_"+crypto.randomUUID();
+    await creditWallet(String(user._id), amountPaise, referenceId, "Local development test credit");
+    const wallet:any=await Wallet.findOne({userId:user._id}).lean();
+    res.json({ok:true,wallet:{balancePaise:wallet?.balancePaise||0,reservedPaise:wallet?.reservedPaise||0}});
+  }catch(e:any){res.status(400).json({message:e.message||"Unable to add test credit"});}
 });
 
 app.get("/api/billing/wallet", async(req,res)=>{
