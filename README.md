@@ -12,6 +12,8 @@ Node.js + Express + TypeScript + MongoDB + Redis backend for SoloSync.
 - ₹0.10/message internal wallet accounting.
 - Server-side Razorpay Checkout verification and webhook HMAC validation.
 - ActiveAdmin-style internal operations dashboard at `/admin`.
+- Developer platform API keys, scoped public API and OpenAPI reference.
+- Developer API playground, connection guide and API integration documentation.
 - Complete local Docker stack with MongoDB, Redis, WAHA, API and frontend.
 
 ## Local: run the whole website
@@ -97,6 +99,12 @@ Use Razorpay for wallet top-ups, not for every message.
 Example: `₹100 = 10,000 paise = 1,000 messages at ₹0.10/message`
 
 Before a paid message is queued, the backend atomically reserves ₹0.10. On successful WAHA delivery it commits the usage; on a final failure it releases the reservation.
+
+## Developer platform
+
+The frontend now provides a professional developer workspace with Overview, Messages, WhatsApp connection, Wallet, API Keys, API Docs, API Playground and Account screens. Public developer endpoints are versioned under `/v1` and use scoped Bearer API keys.
+
+API key secrets are shown only when created or rotated and are stored server-side as hashes. See `docs/developer-platform.md` for the complete integration flow and examples. The machine-readable OpenAPI document is available at `/openapi.json`.
 
 ## Admin dashboard
 The internal dashboard provides:
