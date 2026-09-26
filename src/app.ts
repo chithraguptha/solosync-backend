@@ -17,7 +17,7 @@ import {
 } from "./billing";
 import { mountAdmin } from "./admin";
 import { openapi } from "./openapi";
-import { API_KEY_SCOPES, authenticateApiKey, createApiKey, hasApiKeyScope, listApiKeys, publicApiKeyView, revokeApiKey, rotateApiKey } from "./apiKeys";
+import { API_KEY_SCOPES, authenticateApiKey, createApiKey, hasApiKeyScope, listApiKeys, revokeApiKey, rotateApiKey } from "./apiKeys";
 
 const env = {
   JWT_SECRET: process.env.JWT_SECRET || "change-me",
@@ -680,6 +680,7 @@ app.post("/api/developer/api-keys", async (req, res) => {
     const user: any = await auth(req);
     const name = String(req.body?.name || "").trim();
     const environment = req.body?.environment === "test" ? "test" : "live";
+    if (environment === "test" && env.NODE_ENV === "production") return res.status(400).json({ message: "Test API keys are only available in an isolated non-production environment" });
     const scopes = Array.isArray(req.body?.scopes) ? req.body.scopes.map(String) : [...API_KEY_SCOPES];
     const result = await createApiKey(String(user._id), name, scopes, environment);
     res.status(201).json({ ...result, warning: "This secret is shown once. Store it securely; it cannot be recovered later." });
