@@ -70,6 +70,13 @@ export class WahaClient {
   async startSession(name: string) {
     return this.request(`/api/sessions/${encodeURIComponent(name)}/start`, { method: "POST" });
   }
+  async stopSession(name: string) {
+    return this.request(
+      `/api/sessions/${encodeURIComponent(name)}/stop`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+  }
+
 
   async updateSessionWebhooks(name: string) {
     if (!this.config.webhookUrl) return;
