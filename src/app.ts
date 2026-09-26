@@ -136,6 +136,7 @@ app.use(cookieParser());
 app.use("/api/auth", rateLimit({ windowMs: 60_000, max: 30 }));
 app.use("/api/whatsapp", rateLimit({ windowMs: 60_000, max: 60 }));
 app.use("/v1", rateLimit({ windowMs: 60_000, max: 120 }));
+app.use("/api/developer", rateLimit({ windowMs: 60_000, max: 30 }));
 
 const cookies = { httpOnly: true, secure: env.NODE_ENV === "production", sameSite: "lax" as const, path: "/" };
 const access = (id: string) => jwt.sign({ sub: id, type: "access" }, env.JWT_SECRET, { expiresIn: "15m" });
@@ -671,6 +672,7 @@ app.get("/api/billing/summary", async (req, res) => {
 app.get("/api/developer/api-keys", async (req, res) => {
   try {
     const user: any = await auth(req);
+    res.set("Cache-Control", "no-store");
     res.json({ keys: await listApiKeys(String(user._id)), scopes: API_KEY_SCOPES });
   } catch (e: any) { res.status(401).json({ message: e.message || "Unable to list API keys" }); }
 });
@@ -683,6 +685,7 @@ app.post("/api/developer/api-keys", async (req, res) => {
     if (environment === "test" && env.NODE_ENV === "production") return res.status(400).json({ message: "Test API keys are only available in an isolated non-production environment" });
     const scopes = Array.isArray(req.body?.scopes) ? req.body.scopes.map(String) : [...API_KEY_SCOPES];
     const result = await createApiKey(String(user._id), name, scopes, environment);
+    res.set("Cache-Control", "no-store");
     res.status(201).json({ ...result, warning: "This secret is shown once. Store it securely; it cannot be recovered later." });
   } catch (e: any) { res.status(400).json({ message: e.message || "Unable to create API key" }); }
 });
@@ -691,6 +694,7 @@ app.post("/api/developer/api-keys/:id/rotate", async (req, res) => {
   try {
     const user: any = await auth(req);
     const result = await rotateApiKey(String(user._id), String(req.params.id));
+    res.set("Cache-Control", "no-store");
     res.json({ ...result, warning: "The old key has been revoked. Store the new secret securely; it cannot be recovered later." });
   } catch (e: any) { res.status(400).json({ message: e.message || "Unable to rotate API key" }); }
 });
