@@ -217,6 +217,23 @@ async function developerAuth(req: Request, requiredScope: any) {
   return { key, user };
 }
 
+/// Whether this account still owes the one-time activation fee.
+///
+/// Activation is meant to come first: pay the setup fee, then pair WhatsApp,
+/// then buy message credit. That order was only enforced on the two connect
+/// routes, so an account could top up its wallet and send messages without
+/// ever paying it — and anyone who paired while billing was off never met
+/// the connect gate at all, so they had a clear run at both.
+///
+/// Deliberately NOT applied to:
+///   - the activation order/verify routes, which are how you stop owing it;
+///   - wallet *verify*, because refusing there takes someone's money without
+///     crediting it — a payment already in flight must always be finished;
+///   - reads and disconnect, which cost nothing.
+function owesActivation(user: any) {
+  return env.BILLING_ENABLED && user?.billingStatus !== "ACTIVE";
+}
+
 function developerError(res: express.Response, error: any) {
   const status = Number(error?.statusCode || 500);
   return res.status(status).json({ error: { message: error?.message || "Request failed" } });
@@ -584,7 +601,7 @@ app.post("/api/whatsapp/connect", async (req, res) => {
   try {
     const user: any = await auth(req);
     if (user.billingStatus === "SUSPENDED") return res.status(403).json({ message: "Account is suspended" });
-    if (env.BILLING_ENABLED && user.billingStatus !== "ACTIVE") return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
+    if (owesActivation(user)) return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
     let c: any = await connectionFor(String(user._id));
     if (!c) {
       const sessionName = "user_" + String(user._id);
@@ -687,6 +704,7 @@ app.get("/api/whatsapp/channels", async (req, res) => {
 app.post("/api/whatsapp/publish", async (req, res) => {
   try {
     const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    if (owesActivation(user)) return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
     if (!c) return res.status(400).json({ message: "Connect WhatsApp first" });
     const chatId = String(req.body.chatId || "").trim(), text = String(req.body.text || "");
     const kind = String(req.body.kind || "text"), mediaUrl = req.body.mediaUrl ? String(req.body.mediaUrl) : undefined;
@@ -863,7 +881,7 @@ app.delete("/v1/connection", async (req, res) => {
 app.post("/v1/connection", async (req, res) => {
   try {
     const { user } = await developerAuth(req, "connection:manage");
-    if (env.BILLING_ENABLED && user.billingStatus !== "ACTIVE") return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
+    if (owesActivation(user)) return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
     let c: any = await connectionFor(String(user._id));
     if (!c) {
       const sessionName = "user_" + String(user._id);
@@ -918,6 +936,7 @@ app.get("/v1/messages", async (req, res) => {
 app.post("/v1/messages", async (req, res) => {
   try {
     const { user } = await developerAuth(req, "messages:send");
+    if (owesActivation(user)) return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
     const c: any = await connectionFor(String(user._id));
     if (!c) return res.status(409).json({ error: { code: "NOT_CONNECTED", message: "Connect WhatsApp first" } });
     const chatId = String(req.body?.chatId || "").trim();
@@ -994,6 +1013,7 @@ app.post("/api/billing/activation/verify", async (req,res) => {
 app.post("/api/billing/wallet/order", async (req,res) => {
   try {
     const user:any=await auth(req);
+    if(owesActivation(user)) return res.status(402).json({message:"Activation payment required before adding wallet credit",code:"ACTIVATION_REQUIRED"});
     if(!env.BILLING_ENABLED) return res.json({disabled:true});
     const amountPaise=Math.round(Number(req.body.amountPaise||0));
     if(!Number.isInteger(amountPaise) || amountPaise<10000 || amountPaise>100000000) return res.status(400).json({message:"Top-up must be between ₹100 and ₹1,000,000"});
