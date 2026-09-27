@@ -109,8 +109,44 @@ const BillingLedger = mongoose.model("BillingLedger", new Schema(
   { timestamps: true },
 ));
 
-const redis = createClient({ url: process.env.REDIS_URL || "redis://localhost:6379" });
+// A managed Valkey/Redis sits behind a load balancer that drops idle TLS
+// connections, so a socket error is a normal event here, not an exceptional
+// one. Two things follow from that, and both were missing.
+//
+// pingInterval keeps the connection from going idle long enough to be culled.
+// The main client is idle between requests and the worker's client blocks on
+// brPop, so without traffic both sockets are candidates for the reaper.
+const redis = createClient({
+  url: process.env.REDIS_URL || "redis://localhost:6379",
+  pingInterval: 30000,
+  socket: {
+    keepAlive: true,
+    keepAliveInitialDelay: 15000,
+    // Reconnect forever with a bounded backoff. The default gives up, and a
+    // backend that has permanently stopped talking to Redis cannot issue a
+    // session — every login and logout would hang instead of failing.
+    reconnectStrategy: (retries: number) => Math.min(1000 * 2 ** Math.min(retries, 5), 30000),
+  },
+});
 const workerRedis = redis.duplicate();
+
+// node-redis is an EventEmitter, and an EventEmitter with no 'error' listener
+// rethrows, which takes the process down. That is what was happening: the
+// managed Valkey dropped an idle socket, 'error' fired with ETIMEDOUT, nothing
+// was listening, and Node exited with "Unhandled 'error' event". Docker
+// restarted the container and the cycle repeated every few minutes.
+//
+// The visible damage was worse than a restart loop. Requests that touch Redis
+// — register, login, logout, the OAuth state check — queue their command on a
+// dead socket and hang until the client times out, while /health, which
+// touches nothing, keeps answering 200. The service looks up and is not.
+for (const [label, client] of [["redis", redis], ["redis.worker", workerRedis]] as const) {
+  client.on("error", (e: Error) => console.error(JSON.stringify({
+    event: "redis.error", client: label, message: e.message,
+  })));
+  client.on("reconnecting", () => console.warn(JSON.stringify({ event: "redis.reconnecting", client: label })));
+  client.on("ready", () => console.log(JSON.stringify({ event: "redis.ready", client: label })));
+}
 const waha = new WahaClient({
   baseUrl: env.WAHA_URL,
   apiKey: env.WAHA_API_KEY,
@@ -415,7 +451,22 @@ async function worker() {
   }));
 
   for (;;) {
-    const item = await workerRedis.brPop("solosync:publish", 0);
+    let item;
+    try {
+      // A finite timeout rather than brPop(key, 0). Blocking forever leaves
+      // the socket silent for as long as the queue is empty, which on a
+      // managed Valkey means it gets reaped; the client then reconnects and
+      // the blocked call is lost, so the worker waits on a pop that will
+      // never return while messages pile up behind it. Returning null every
+      // 30s costs nothing and keeps the loop owned by us.
+      item = await workerRedis.brPop("solosync:publish", 30);
+    } catch (e: any) {
+      // Almost always a reconnect mid-pop. Pause briefly so a persistent
+      // failure cannot become a hot loop, then wait on the queue again.
+      console.error(JSON.stringify({ event: "publication.worker_pop_failed", message: e?.message }));
+      await new Promise(r => setTimeout(r, 1000));
+      continue;
+    }
     if (!item) continue;
 
     const payload = JSON.parse(item.element);
@@ -580,6 +631,41 @@ app.get("/api/whatsapp/status", async (req, res) => {
     await c.save();
     res.json({ connected: session.status === "WORKING", status: session.status, connection: c, session, error: c.error || null });
   } catch (e: any) { res.status(502).json({ message: e.message || "Unable to read WhatsApp status" }); }
+});
+
+/// Unlinks WhatsApp and forgets the pairing.
+///
+/// Best-effort against WAHA on purpose. If the session is already gone, or
+/// WAHA is unreachable, the local record must still be cleared — otherwise
+/// the dashboard shows a connection the user cannot use and cannot remove,
+/// and re-pairing is blocked by a row describing a session that no longer
+/// exists. Losing our record while WAHA keeps a stale session is recoverable
+/// (connect creates a fresh one); the reverse is a dead end.
+app.post("/api/whatsapp/disconnect", async (req, res) => {
+  try {
+    const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
+
+    const warnings: string[] = [];
+    for (const [step, run] of [
+      ["logout", () => waha.logoutSession(c.sessionName)],
+      ["delete", () => waha.deleteSession(c.sessionName)],
+    ] as const) {
+      try { await run(); }
+      catch (e: any) { warnings.push(`${step}: ${e?.message || "failed"}`); }
+    }
+
+    await c.deleteOne();
+    res.json({
+      connected: false,
+      status: "NOT_CONNECTED",
+      disconnected: true,
+      // Surfaced rather than swallowed: if WAHA kept the session, the phone
+      // may still list SoloSync under linked devices and the user should be
+      // told to remove it there.
+      warnings: warnings.length ? warnings : undefined,
+    });
+  } catch (e: any) { res.status(502).json({ message: e.message || "Unable to disconnect WhatsApp" }); }
 });
 
 app.get("/api/whatsapp/qr", async (req, res) => {
@@ -749,6 +835,28 @@ app.get("/v1/connection", async (req, res) => {
     c.pushName = session.me?.pushName || c.pushName;
     await c.save();
     res.json({ connected: session.status === "WORKING", status: session.status, connection: { phoneNumber: c.phoneNumber || null, pushName: c.pushName || null, sessionName: c.sessionName } });
+  } catch (e: any) { developerError(res, e); }
+});
+
+/// The API-key equivalent of the dashboard's disconnect. Same best-effort
+/// semantics: the local pairing is always cleared.
+app.delete("/v1/connection", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:manage");
+    const c: any = await connectionFor(String(user._id));
+    if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
+
+    const warnings: string[] = [];
+    for (const [step, run] of [
+      ["logout", () => waha.logoutSession(c.sessionName)],
+      ["delete", () => waha.deleteSession(c.sessionName)],
+    ] as const) {
+      try { await run(); }
+      catch (e: any) { warnings.push(`${step}: ${e?.message || "failed"}`); }
+    }
+
+    await c.deleteOne();
+    res.json({ connected: false, status: "NOT_CONNECTED", disconnected: true, warnings: warnings.length ? warnings : undefined });
   } catch (e: any) { developerError(res, e); }
 });
 
