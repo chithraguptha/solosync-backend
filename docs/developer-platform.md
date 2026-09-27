@@ -125,7 +125,7 @@ Use `GET /v1/messages` to inspect `status`, `deliveryStatus`, `providerMessageId
 
 The current billing model is:
 
-- Account activation: **₹399**
+- Account activation: **₹299** (one-time)
 - Message usage: **₹0.10/message**
 - Wallet top-ups: Razorpay
 - Message credit is reserved before queueing and finalized after successful publication; a final failure releases the reservation.
