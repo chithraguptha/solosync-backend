@@ -149,7 +149,7 @@ Analytics are derived from publication history: total, successful, failed, queue
 
 ## Razorpay billing architecture
 
-Razorpay should handle relatively large payment events, not a new payment transaction for every ₹0.10 message. Use Razorpay for the ₹399 activation and prepaid wallet top-ups; use an internal paise ledger for message consumption.
+Razorpay should handle relatively large payment events, not a new payment transaction for every ₹0.50 message. Use Razorpay for the ₹299 activation and prepaid wallet top-ups; use an internal paise ledger for message consumption.
 
 ```mermaid
 flowchart TD
@@ -167,13 +167,13 @@ flowchart TD
 
 ### Activation
 
-First WhatsApp activation costs ₹399. The backend creates the Order, the frontend opens Checkout, and the backend verifies the returned signature. The webhook then reconciles the payment idempotently. Only a verified/captured activation should enable the WhatsApp connection.
+First WhatsApp activation costs ₹299. The backend creates the Order, the frontend opens Checkout, and the backend verifies the returned signature. The webhook then reconciles the payment idempotently. Only a verified/captured activation should enable the WhatsApp connection.
 
 ### Message usage
 
-Do not create a Razorpay transaction for every ₹0.10 message. User tops up prepaid credits, the backend credits the wallet after verified payment, and each successful message consumes ₹0.10 internally. Reserve before sending, commit on successful WAHA delivery, and release the reservation on failure.
+Do not create a Razorpay transaction for every ₹0.50 message. User tops up prepaid credits, the backend credits the wallet after verified payment, and each successful message consumes ₹0.50 internally. Reserve before sending, commit on successful WAHA delivery, and release the reservation on failure.
 
-Example: ₹100 top-up = 10,000 paise = 1,000 message credits at ₹0.10/message.
+Example: ₹100 top-up = 10,000 paise = 200 message credits at ₹0.50/message.
 
 ## Planned Razorpay data model
 
@@ -244,7 +244,7 @@ Run `docker compose -f docker-compose.local.yml up --build` from the backend rep
 flowchart TD
   A[Google Login] --> B[Dashboard]
   B --> C{Activated?}
-  C -->|No| D[₹399 Razorpay Checkout]
+  C -->|No| D[₹299 Razorpay Checkout]
   D --> E[Verify + Webhook]
   E --> F[ACTIVE]
   C -->|Yes| F
@@ -254,7 +254,7 @@ flowchart TD
   I --> J[Top up wallet]
   J --> K[Razorpay Checkout]
   K --> L[Wallet credited]
-  L --> M[Reserve ₹0.10]
+  L --> M[Reserve ₹0.50]
   M --> N[Send through WAHA]
   N -->|success| O[Commit usage]
   N -->|failure| P[Release reservation]

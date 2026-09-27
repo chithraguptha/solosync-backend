@@ -35,7 +35,7 @@ const env = {
   GOOGLE_REDIRECT_URI: process.env.GOOGLE_REDIRECT_URI || "http://localhost:4000/api/auth/google/callback",
   BILLING_ENABLED: process.env.BILLING_ENABLED === "true",
   ACTIVATION_FEE_PAISE: Number(process.env.ACTIVATION_FEE_PAISE || 29900),
-  MESSAGE_FEE_PAISE: Number(process.env.MESSAGE_FEE_PAISE || 10),
+  MESSAGE_FEE_PAISE: Number(process.env.MESSAGE_FEE_PAISE || 50),
   RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || "",
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || "",
   RAZORPAY_WEBHOOK_SECRET: process.env.RAZORPAY_WEBHOOK_SECRET || "",
