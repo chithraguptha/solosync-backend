@@ -64,6 +64,43 @@ flowchart TD
 
 Every publication stores recipient, type, content/media reference, status, attempts, provider message ID, error and timestamps.
 
+## Redis connections
+
+Two clients: the request path uses `redis`, and the publisher worker uses
+`workerRedis`, a `duplicate()`. They are separate because the worker issues a
+blocking pop, which would otherwise hold up every session write queued behind
+it on the same connection.
+
+Both are configured for a managed Redis behind a load balancer, which drops
+idle connections. Three things follow, and all three were learned the hard
+way in production:
+
+**Both clients register an `error` listener.** `node-redis` is an
+EventEmitter, and an EventEmitter with no `error` listener rethrows — a
+dropped socket exited the process with `Unhandled 'error' event: read
+ETIMEDOUT`. Docker restarted it; the cycle repeated every few minutes.
+
+**The reconnect strategy never gives up**, with a bounded backoff. The default
+stops retrying, and a backend that has permanently stopped talking to Redis
+cannot issue a session, so every login and logout hangs rather than failing.
+
+**`pingInterval` keeps the socket warm** so it is not idle long enough to be
+reaped in the first place.
+
+The worker polls with `brPop(key, 30)` rather than blocking indefinitely with
+`0`. An infinite block means silence on that socket whenever the queue is
+empty — the connection gets reaped, the client reconnects, and the blocked
+call is lost, leaving the worker waiting on a pop that will never return while
+messages pile up behind it. A failed pop is treated as a reconnect, not as
+fatal.
+
+### Health versus readiness
+
+`/health` returns `{"status":"ok"}` without touching anything. `/ready` pings
+Mongo and Redis. Monitor `/ready`: during the crash loop above, `/health`
+answered 200 throughout while nobody could sign in, because only the endpoints
+reaching Redis were affected and they hung rather than erroring.
+
 ## Dashboard analytics
 
 Analytics are derived from publication history: total, successful, failed, queued/publishing, success rate, failure rate, and last-24-hour volume.
