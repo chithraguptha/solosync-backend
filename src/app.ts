@@ -69,7 +69,13 @@ const WhatsappConnection = mongoose.model("WhatsappConnection", new Schema(
     provider: { type: String, default: "waha" },
     sessionName: { type: String, required: true, unique: true },
     status: { type: String, default: "STOPPED" },
-    phoneNumber: String,
+    // Unique across accounts, sparse so unpaired connections do not collide
+    // on null. Two accounts holding one WhatsApp number means two WhatsApp
+    // Web clients for one phone, and WhatsApp evicts one whenever the other
+    // connects — both sessions then flap between FAILED and a fresh QR
+    // forever. It looks like "the session keeps logging out" and it never
+    // settles, because nothing is broken except that they are fighting.
+    phoneNumber: { type: String, index: { unique: true, sparse: true } },
     pushName: String,
     error: String,
     lastErrorAt: Date,
@@ -376,6 +382,43 @@ async function publish(publicationId: string) {
   }
 }
 
+/// Records who a session belongs to, refusing a number another account
+/// already holds.
+///
+/// Returns an error string when the number is taken, having stopped this
+/// session so the two stop fighting. The incumbent keeps the number: an
+/// account that is already paired should not lose its connection because
+/// someone else scanned with the same phone.
+async function applySessionIdentity(c: any, session: any): Promise<string | null> {
+  const phone = session?.me?.id?.replace("@c.us", "") || "";
+  const pushName = session?.me?.pushName || c.pushName;
+
+  if (phone && phone !== c.phoneNumber) {
+    const other: any = await WhatsappConnection.findOne({
+      phoneNumber: phone, _id: { $ne: c._id },
+    }).lean();
+    if (other) {
+      const message = `WhatsApp number +${phone} is already connected to another SoloSync account. ` +
+        `Disconnect it there first, or pair a different number.`;
+      c.status = "FAILED";
+      c.error = message;
+      c.lastErrorAt = new Date();
+      await c.save();
+      // Stop it, or WAHA keeps reconnecting and keeps evicting the incumbent.
+      try { await waha.stopSession(c.sessionName); } catch {}
+      console.warn(JSON.stringify({
+        event: "whatsapp.duplicate_number", phone,
+        rejected: String(c._id), incumbent: String(other._id),
+      }));
+      return message;
+    }
+  }
+
+  if (phone) c.phoneNumber = phone;
+  c.pushName = pushName;
+  return null;
+}
+
 async function recoverStuckPublications() {
   const cutoff = new Date(Date.now() - env.PUBLISHING_STALE_MS);
   const stuck: any[] = await Publication.find({
@@ -626,8 +669,8 @@ app.post("/api/whatsapp/connect", async (req, res) => {
       session = await waha.getSession(c.sessionName);
     }
     c.status = session.status || c.status;
-    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
-    c.pushName = session.me?.pushName || c.pushName;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.status(409).json({ message: identityError, code: "NUMBER_IN_USE", status: "FAILED", connection: c });
     c.error = session.status === "FAILED" ? String(session.error || session.failureReason || session.reason || "WAHA session failed") : undefined;
     c.lastErrorAt = session.status === "FAILED" ? new Date() : undefined;
     await c.save();
@@ -641,8 +684,8 @@ app.get("/api/whatsapp/status", async (req, res) => {
     if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
     const session: any = await waha.getSession(c.sessionName);
     c.status = session.status || c.status;
-    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
-    c.pushName = session.me?.pushName || c.pushName;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.json({ connected: false, status: "FAILED", connection: c, error: identityError, code: "NUMBER_IN_USE" });
     c.error = session.status === "FAILED" ? String(session.error || session.failureReason || session.reason || c.error || "WAHA session failed") : undefined;
     c.lastErrorAt = session.status === "FAILED" ? new Date() : c.lastErrorAt;
     await c.save();
@@ -849,8 +892,8 @@ app.get("/v1/connection", async (req, res) => {
     if (!c) return res.json({ connected: false, status: "NOT_CONNECTED", connection: null });
     const session: any = await waha.getSession(c.sessionName);
     c.status = session.status || c.status;
-    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
-    c.pushName = session.me?.pushName || c.pushName;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.json({ connected: false, status: "FAILED", error: { code: "NUMBER_IN_USE", message: identityError } });
     await c.save();
     res.json({ connected: session.status === "WORKING", status: session.status, connection: { phoneNumber: c.phoneNumber || null, pushName: c.pushName || null, sessionName: c.sessionName } });
   } catch (e: any) { developerError(res, e); }
@@ -899,8 +942,8 @@ app.post("/v1/connection", async (req, res) => {
       session = await waha.getSession(c.sessionName);
     }
     c.status = session.status || c.status;
-    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
-    c.pushName = session.me?.pushName || c.pushName;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.status(409).json({ error: { code: "NUMBER_IN_USE", message: identityError } });
     await c.save();
     let qr: any = null;
     if (session.status === "SCAN_QR_CODE") {
