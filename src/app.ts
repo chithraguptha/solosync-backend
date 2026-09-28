@@ -34,8 +34,8 @@ const env = {
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET || "",
   GOOGLE_REDIRECT_URI: process.env.GOOGLE_REDIRECT_URI || "http://localhost:4000/api/auth/google/callback",
   BILLING_ENABLED: process.env.BILLING_ENABLED === "true",
-  ACTIVATION_FEE_PAISE: Number(process.env.ACTIVATION_FEE_PAISE || 39900),
-  MESSAGE_FEE_PAISE: Number(process.env.MESSAGE_FEE_PAISE || 10),
+  ACTIVATION_FEE_PAISE: Number(process.env.ACTIVATION_FEE_PAISE || 29900),
+  MESSAGE_FEE_PAISE: Number(process.env.MESSAGE_FEE_PAISE || 50),
   RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || "",
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || "",
   RAZORPAY_WEBHOOK_SECRET: process.env.RAZORPAY_WEBHOOK_SECRET || "",
@@ -69,7 +69,13 @@ const WhatsappConnection = mongoose.model("WhatsappConnection", new Schema(
     provider: { type: String, default: "waha" },
     sessionName: { type: String, required: true, unique: true },
     status: { type: String, default: "STOPPED" },
-    phoneNumber: String,
+    // Unique across accounts, sparse so unpaired connections do not collide
+    // on null. Two accounts holding one WhatsApp number means two WhatsApp
+    // Web clients for one phone, and WhatsApp evicts one whenever the other
+    // connects — both sessions then flap between FAILED and a fresh QR
+    // forever. It looks like "the session keeps logging out" and it never
+    // settles, because nothing is broken except that they are fighting.
+    phoneNumber: { type: String, index: { unique: true, sparse: true } },
     pushName: String,
     error: String,
     lastErrorAt: Date,
@@ -109,8 +115,44 @@ const BillingLedger = mongoose.model("BillingLedger", new Schema(
   { timestamps: true },
 ));
 
-const redis = createClient({ url: process.env.REDIS_URL || "redis://localhost:6379" });
+// A managed Valkey/Redis sits behind a load balancer that drops idle TLS
+// connections, so a socket error is a normal event here, not an exceptional
+// one. Two things follow from that, and both were missing.
+//
+// pingInterval keeps the connection from going idle long enough to be culled.
+// The main client is idle between requests and the worker's client blocks on
+// brPop, so without traffic both sockets are candidates for the reaper.
+const redis = createClient({
+  url: process.env.REDIS_URL || "redis://localhost:6379",
+  pingInterval: 30000,
+  socket: {
+    keepAlive: true,
+    keepAliveInitialDelay: 15000,
+    // Reconnect forever with a bounded backoff. The default gives up, and a
+    // backend that has permanently stopped talking to Redis cannot issue a
+    // session — every login and logout would hang instead of failing.
+    reconnectStrategy: (retries: number) => Math.min(1000 * 2 ** Math.min(retries, 5), 30000),
+  },
+});
 const workerRedis = redis.duplicate();
+
+// node-redis is an EventEmitter, and an EventEmitter with no 'error' listener
+// rethrows, which takes the process down. That is what was happening: the
+// managed Valkey dropped an idle socket, 'error' fired with ETIMEDOUT, nothing
+// was listening, and Node exited with "Unhandled 'error' event". Docker
+// restarted the container and the cycle repeated every few minutes.
+//
+// The visible damage was worse than a restart loop. Requests that touch Redis
+// — register, login, logout, the OAuth state check — queue their command on a
+// dead socket and hang until the client times out, while /health, which
+// touches nothing, keeps answering 200. The service looks up and is not.
+for (const [label, client] of [["redis", redis], ["redis.worker", workerRedis]] as const) {
+  client.on("error", (e: Error) => console.error(JSON.stringify({
+    event: "redis.error", client: label, message: e.message,
+  })));
+  client.on("reconnecting", () => console.warn(JSON.stringify({ event: "redis.reconnecting", client: label })));
+  client.on("ready", () => console.log(JSON.stringify({ event: "redis.ready", client: label })));
+}
 const waha = new WahaClient({
   baseUrl: env.WAHA_URL,
   apiKey: env.WAHA_API_KEY,
@@ -179,6 +221,23 @@ async function developerAuth(req: Request, requiredScope: any) {
   if (!user) throw Object.assign(new Error("Account not found"), { statusCode: 401 });
   if (user.billingStatus === "SUSPENDED") throw Object.assign(new Error("Account is suspended"), { statusCode: 403 });
   return { key, user };
+}
+
+/// Whether this account still owes the one-time activation fee.
+///
+/// Activation is meant to come first: pay the setup fee, then pair WhatsApp,
+/// then buy message credit. That order was only enforced on the two connect
+/// routes, so an account could top up its wallet and send messages without
+/// ever paying it — and anyone who paired while billing was off never met
+/// the connect gate at all, so they had a clear run at both.
+///
+/// Deliberately NOT applied to:
+///   - the activation order/verify routes, which are how you stop owing it;
+///   - wallet *verify*, because refusing there takes someone's money without
+///     crediting it — a payment already in flight must always be finished;
+///   - reads and disconnect, which cost nothing.
+function owesActivation(user: any) {
+  return env.BILLING_ENABLED && user?.billingStatus !== "ACTIVE";
 }
 
 function developerError(res: express.Response, error: any) {
@@ -323,6 +382,43 @@ async function publish(publicationId: string) {
   }
 }
 
+/// Records who a session belongs to, refusing a number another account
+/// already holds.
+///
+/// Returns an error string when the number is taken, having stopped this
+/// session so the two stop fighting. The incumbent keeps the number: an
+/// account that is already paired should not lose its connection because
+/// someone else scanned with the same phone.
+async function applySessionIdentity(c: any, session: any): Promise<string | null> {
+  const phone = session?.me?.id?.replace("@c.us", "") || "";
+  const pushName = session?.me?.pushName || c.pushName;
+
+  if (phone && phone !== c.phoneNumber) {
+    const other: any = await WhatsappConnection.findOne({
+      phoneNumber: phone, _id: { $ne: c._id },
+    }).lean();
+    if (other) {
+      const message = `WhatsApp number +${phone} is already connected to another SoloSync account. ` +
+        `Disconnect it there first, or pair a different number.`;
+      c.status = "FAILED";
+      c.error = message;
+      c.lastErrorAt = new Date();
+      await c.save();
+      // Stop it, or WAHA keeps reconnecting and keeps evicting the incumbent.
+      try { await waha.stopSession(c.sessionName); } catch {}
+      console.warn(JSON.stringify({
+        event: "whatsapp.duplicate_number", phone,
+        rejected: String(c._id), incumbent: String(other._id),
+      }));
+      return message;
+    }
+  }
+
+  if (phone) c.phoneNumber = phone;
+  c.pushName = pushName;
+  return null;
+}
+
 async function recoverStuckPublications() {
   const cutoff = new Date(Date.now() - env.PUBLISHING_STALE_MS);
   const stuck: any[] = await Publication.find({
@@ -415,7 +511,22 @@ async function worker() {
   }));
 
   for (;;) {
-    const item = await workerRedis.brPop("solosync:publish", 0);
+    let item;
+    try {
+      // A finite timeout rather than brPop(key, 0). Blocking forever leaves
+      // the socket silent for as long as the queue is empty, which on a
+      // managed Valkey means it gets reaped; the client then reconnects and
+      // the blocked call is lost, so the worker waits on a pop that will
+      // never return while messages pile up behind it. Returning null every
+      // 30s costs nothing and keeps the loop owned by us.
+      item = await workerRedis.brPop("solosync:publish", 30);
+    } catch (e: any) {
+      // Almost always a reconnect mid-pop. Pause briefly so a persistent
+      // failure cannot become a hot loop, then wait on the queue again.
+      console.error(JSON.stringify({ event: "publication.worker_pop_failed", message: e?.message }));
+      await new Promise(r => setTimeout(r, 1000));
+      continue;
+    }
     if (!item) continue;
 
     const payload = JSON.parse(item.element);
@@ -533,7 +644,7 @@ app.post("/api/whatsapp/connect", async (req, res) => {
   try {
     const user: any = await auth(req);
     if (user.billingStatus === "SUSPENDED") return res.status(403).json({ message: "Account is suspended" });
-    if (env.BILLING_ENABLED && user.billingStatus !== "ACTIVE") return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
+    if (owesActivation(user)) return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
     let c: any = await connectionFor(String(user._id));
     if (!c) {
       const sessionName = "user_" + String(user._id);
@@ -558,8 +669,8 @@ app.post("/api/whatsapp/connect", async (req, res) => {
       session = await waha.getSession(c.sessionName);
     }
     c.status = session.status || c.status;
-    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
-    c.pushName = session.me?.pushName || c.pushName;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.status(409).json({ message: identityError, code: "NUMBER_IN_USE", status: "FAILED", connection: c });
     c.error = session.status === "FAILED" ? String(session.error || session.failureReason || session.reason || "WAHA session failed") : undefined;
     c.lastErrorAt = session.status === "FAILED" ? new Date() : undefined;
     await c.save();
@@ -573,13 +684,48 @@ app.get("/api/whatsapp/status", async (req, res) => {
     if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
     const session: any = await waha.getSession(c.sessionName);
     c.status = session.status || c.status;
-    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
-    c.pushName = session.me?.pushName || c.pushName;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.json({ connected: false, status: "FAILED", connection: c, error: identityError, code: "NUMBER_IN_USE" });
     c.error = session.status === "FAILED" ? String(session.error || session.failureReason || session.reason || c.error || "WAHA session failed") : undefined;
     c.lastErrorAt = session.status === "FAILED" ? new Date() : c.lastErrorAt;
     await c.save();
     res.json({ connected: session.status === "WORKING", status: session.status, connection: c, session, error: c.error || null });
   } catch (e: any) { res.status(502).json({ message: e.message || "Unable to read WhatsApp status" }); }
+});
+
+/// Unlinks WhatsApp and forgets the pairing.
+///
+/// Best-effort against WAHA on purpose. If the session is already gone, or
+/// WAHA is unreachable, the local record must still be cleared — otherwise
+/// the dashboard shows a connection the user cannot use and cannot remove,
+/// and re-pairing is blocked by a row describing a session that no longer
+/// exists. Losing our record while WAHA keeps a stale session is recoverable
+/// (connect creates a fresh one); the reverse is a dead end.
+app.post("/api/whatsapp/disconnect", async (req, res) => {
+  try {
+    const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
+
+    const warnings: string[] = [];
+    for (const [step, run] of [
+      ["logout", () => waha.logoutSession(c.sessionName)],
+      ["delete", () => waha.deleteSession(c.sessionName)],
+    ] as const) {
+      try { await run(); }
+      catch (e: any) { warnings.push(`${step}: ${e?.message || "failed"}`); }
+    }
+
+    await c.deleteOne();
+    res.json({
+      connected: false,
+      status: "NOT_CONNECTED",
+      disconnected: true,
+      // Surfaced rather than swallowed: if WAHA kept the session, the phone
+      // may still list SoloSync under linked devices and the user should be
+      // told to remove it there.
+      warnings: warnings.length ? warnings : undefined,
+    });
+  } catch (e: any) { res.status(502).json({ message: e.message || "Unable to disconnect WhatsApp" }); }
 });
 
 app.get("/api/whatsapp/qr", async (req, res) => {
@@ -601,6 +747,7 @@ app.get("/api/whatsapp/channels", async (req, res) => {
 app.post("/api/whatsapp/publish", async (req, res) => {
   try {
     const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    if (owesActivation(user)) return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
     if (!c) return res.status(400).json({ message: "Connect WhatsApp first" });
     const chatId = String(req.body.chatId || "").trim(), text = String(req.body.text || "");
     const kind = String(req.body.kind || "text"), mediaUrl = req.body.mediaUrl ? String(req.body.mediaUrl) : undefined;
@@ -745,17 +892,39 @@ app.get("/v1/connection", async (req, res) => {
     if (!c) return res.json({ connected: false, status: "NOT_CONNECTED", connection: null });
     const session: any = await waha.getSession(c.sessionName);
     c.status = session.status || c.status;
-    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
-    c.pushName = session.me?.pushName || c.pushName;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.json({ connected: false, status: "FAILED", error: { code: "NUMBER_IN_USE", message: identityError } });
     await c.save();
     res.json({ connected: session.status === "WORKING", status: session.status, connection: { phoneNumber: c.phoneNumber || null, pushName: c.pushName || null, sessionName: c.sessionName } });
+  } catch (e: any) { developerError(res, e); }
+});
+
+/// The API-key equivalent of the dashboard's disconnect. Same best-effort
+/// semantics: the local pairing is always cleared.
+app.delete("/v1/connection", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:manage");
+    const c: any = await connectionFor(String(user._id));
+    if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
+
+    const warnings: string[] = [];
+    for (const [step, run] of [
+      ["logout", () => waha.logoutSession(c.sessionName)],
+      ["delete", () => waha.deleteSession(c.sessionName)],
+    ] as const) {
+      try { await run(); }
+      catch (e: any) { warnings.push(`${step}: ${e?.message || "failed"}`); }
+    }
+
+    await c.deleteOne();
+    res.json({ connected: false, status: "NOT_CONNECTED", disconnected: true, warnings: warnings.length ? warnings : undefined });
   } catch (e: any) { developerError(res, e); }
 });
 
 app.post("/v1/connection", async (req, res) => {
   try {
     const { user } = await developerAuth(req, "connection:manage");
-    if (env.BILLING_ENABLED && user.billingStatus !== "ACTIVE") return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
+    if (owesActivation(user)) return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
     let c: any = await connectionFor(String(user._id));
     if (!c) {
       const sessionName = "user_" + String(user._id);
@@ -773,8 +942,8 @@ app.post("/v1/connection", async (req, res) => {
       session = await waha.getSession(c.sessionName);
     }
     c.status = session.status || c.status;
-    c.phoneNumber = session.me?.id?.replace("@c.us", "") || c.phoneNumber;
-    c.pushName = session.me?.pushName || c.pushName;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.status(409).json({ error: { code: "NUMBER_IN_USE", message: identityError } });
     await c.save();
     let qr: any = null;
     if (session.status === "SCAN_QR_CODE") {
@@ -810,6 +979,7 @@ app.get("/v1/messages", async (req, res) => {
 app.post("/v1/messages", async (req, res) => {
   try {
     const { user } = await developerAuth(req, "messages:send");
+    if (owesActivation(user)) return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
     const c: any = await connectionFor(String(user._id));
     if (!c) return res.status(409).json({ error: { code: "NOT_CONNECTED", message: "Connect WhatsApp first" } });
     const chatId = String(req.body?.chatId || "").trim();
@@ -886,6 +1056,7 @@ app.post("/api/billing/activation/verify", async (req,res) => {
 app.post("/api/billing/wallet/order", async (req,res) => {
   try {
     const user:any=await auth(req);
+    if(owesActivation(user)) return res.status(402).json({message:"Activation payment required before adding wallet credit",code:"ACTIVATION_REQUIRED"});
     if(!env.BILLING_ENABLED) return res.json({disabled:true});
     const amountPaise=Math.round(Number(req.body.amountPaise||0));
     if(!Number.isInteger(amountPaise) || amountPaise<10000 || amountPaise>100000000) return res.status(400).json({message:"Top-up must be between ₹100 and ₹1,000,000"});
@@ -1009,11 +1180,40 @@ app.post("/webhooks/waha", async (req, res) => {
     }
 
     res.status(204).end();
-  } catch { res.status(400).json({ message: "Invalid webhook" }); }
+  } catch (e: any) {
+    // WAHA retries 15 times per event, so a webhook that always throws is a
+    // retry storm. Logging the reason is the difference between a fixable
+    // bug and a wall of "Retrying 12/15" with nothing to go on.
+    console.error(JSON.stringify({
+      event: "waha.webhook_failed",
+      wahaEvent: req.body?.event, session: req.body?.session,
+      message: e?.message || String(e),
+    }));
+    res.status(400).json({ message: "Invalid webhook" });
+  }
 });
 
 export async function startApp() {
   await mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/solosync");
+
+  // Mongoose builds indexes in the background and reports failures on an
+  // event nobody was listening to. The unique phoneNumber index silently did
+  // not exist, because it was first built while two accounts still shared a
+  // number — so the guarantee it was added for was simply absent, and the
+  // only sign was its absence from a listing nobody reads.
+  //
+  // Awaiting it makes a failure loud at boot. It is not fatal: an index that
+  // cannot build usually means existing data violates it, and refusing to
+  // start would turn a data problem into an outage.
+  for (const name of mongoose.modelNames()) {
+    try { await mongoose.model(name).syncIndexes(); }
+    catch (e: any) {
+      console.error(JSON.stringify({
+        event: "mongo.index_build_failed", model: name, message: e?.message,
+        hint: "existing documents probably violate a unique index",
+      }));
+    }
+  }
   await redis.connect();
   app.listen(Number(process.env.PORT || 4000), "0.0.0.0", () => console.log("SoloSync API listening"));
   worker().catch(e => console.error("publisher worker stopped", e));

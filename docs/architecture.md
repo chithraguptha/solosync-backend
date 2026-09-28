@@ -64,6 +64,43 @@ flowchart TD
 
 Every publication stores recipient, type, content/media reference, status, attempts, provider message ID, error and timestamps.
 
+## Redis connections
+
+Two clients: the request path uses `redis`, and the publisher worker uses
+`workerRedis`, a `duplicate()`. They are separate because the worker issues a
+blocking pop, which would otherwise hold up every session write queued behind
+it on the same connection.
+
+Both are configured for a managed Redis behind a load balancer, which drops
+idle connections. Three things follow, and all three were learned the hard
+way in production:
+
+**Both clients register an `error` listener.** `node-redis` is an
+EventEmitter, and an EventEmitter with no `error` listener rethrows — a
+dropped socket exited the process with `Unhandled 'error' event: read
+ETIMEDOUT`. Docker restarted it; the cycle repeated every few minutes.
+
+**The reconnect strategy never gives up**, with a bounded backoff. The default
+stops retrying, and a backend that has permanently stopped talking to Redis
+cannot issue a session, so every login and logout hangs rather than failing.
+
+**`pingInterval` keeps the socket warm** so it is not idle long enough to be
+reaped in the first place.
+
+The worker polls with `brPop(key, 30)` rather than blocking indefinitely with
+`0`. An infinite block means silence on that socket whenever the queue is
+empty — the connection gets reaped, the client reconnects, and the blocked
+call is lost, leaving the worker waiting on a pop that will never return while
+messages pile up behind it. A failed pop is treated as a reconnect, not as
+fatal.
+
+### Health versus readiness
+
+`/health` returns `{"status":"ok"}` without touching anything. `/ready` pings
+Mongo and Redis. Monitor `/ready`: during the crash loop above, `/health`
+answered 200 throughout while nobody could sign in, because only the endpoints
+reaching Redis were affected and they hung rather than erroring.
+
 ## Dashboard analytics
 
 Analytics are derived from publication history: total, successful, failed, queued/publishing, success rate, failure rate, and last-24-hour volume.
@@ -112,7 +149,7 @@ Analytics are derived from publication history: total, successful, failed, queue
 
 ## Razorpay billing architecture
 
-Razorpay should handle relatively large payment events, not a new payment transaction for every ₹0.10 message. Use Razorpay for the ₹399 activation and prepaid wallet top-ups; use an internal paise ledger for message consumption.
+Razorpay should handle relatively large payment events, not a new payment transaction for every ₹0.50 message. Use Razorpay for the ₹299 activation and prepaid wallet top-ups; use an internal paise ledger for message consumption.
 
 ```mermaid
 flowchart TD
@@ -130,13 +167,13 @@ flowchart TD
 
 ### Activation
 
-First WhatsApp activation costs ₹399. The backend creates the Order, the frontend opens Checkout, and the backend verifies the returned signature. The webhook then reconciles the payment idempotently. Only a verified/captured activation should enable the WhatsApp connection.
+First WhatsApp activation costs ₹299. The backend creates the Order, the frontend opens Checkout, and the backend verifies the returned signature. The webhook then reconciles the payment idempotently. Only a verified/captured activation should enable the WhatsApp connection.
 
 ### Message usage
 
-Do not create a Razorpay transaction for every ₹0.10 message. User tops up prepaid credits, the backend credits the wallet after verified payment, and each successful message consumes ₹0.10 internally. Reserve before sending, commit on successful WAHA delivery, and release the reservation on failure.
+Do not create a Razorpay transaction for every ₹0.50 message. User tops up prepaid credits, the backend credits the wallet after verified payment, and each successful message consumes ₹0.50 internally. Reserve before sending, commit on successful WAHA delivery, and release the reservation on failure.
 
-Example: ₹100 top-up = 10,000 paise = 1,000 message credits at ₹0.10/message.
+Example: ₹100 top-up = 10,000 paise = 200 message credits at ₹0.50/message.
 
 ## Planned Razorpay data model
 
@@ -207,7 +244,7 @@ Run `docker compose -f docker-compose.local.yml up --build` from the backend rep
 flowchart TD
   A[Google Login] --> B[Dashboard]
   B --> C{Activated?}
-  C -->|No| D[₹399 Razorpay Checkout]
+  C -->|No| D[₹299 Razorpay Checkout]
   D --> E[Verify + Webhook]
   E --> F[ACTIVE]
   C -->|Yes| F
@@ -217,7 +254,7 @@ flowchart TD
   I --> J[Top up wallet]
   J --> K[Razorpay Checkout]
   K --> L[Wallet credited]
-  L --> M[Reserve ₹0.10]
+  L --> M[Reserve ₹0.50]
   M --> N[Send through WAHA]
   N -->|success| O[Commit usage]
   N -->|failure| P[Release reservation]
