@@ -1180,11 +1180,40 @@ app.post("/webhooks/waha", async (req, res) => {
     }
 
     res.status(204).end();
-  } catch { res.status(400).json({ message: "Invalid webhook" }); }
+  } catch (e: any) {
+    // WAHA retries 15 times per event, so a webhook that always throws is a
+    // retry storm. Logging the reason is the difference between a fixable
+    // bug and a wall of "Retrying 12/15" with nothing to go on.
+    console.error(JSON.stringify({
+      event: "waha.webhook_failed",
+      wahaEvent: req.body?.event, session: req.body?.session,
+      message: e?.message || String(e),
+    }));
+    res.status(400).json({ message: "Invalid webhook" });
+  }
 });
 
 export async function startApp() {
   await mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/solosync");
+
+  // Mongoose builds indexes in the background and reports failures on an
+  // event nobody was listening to. The unique phoneNumber index silently did
+  // not exist, because it was first built while two accounts still shared a
+  // number — so the guarantee it was added for was simply absent, and the
+  // only sign was its absence from a listing nobody reads.
+  //
+  // Awaiting it makes a failure loud at boot. It is not fatal: an index that
+  // cannot build usually means existing data violates it, and refusing to
+  // start would turn a data problem into an outage.
+  for (const name of mongoose.modelNames()) {
+    try { await mongoose.model(name).syncIndexes(); }
+    catch (e: any) {
+      console.error(JSON.stringify({
+        event: "mongo.index_build_failed", model: name, message: e?.message,
+        hint: "existing documents probably violate a unique index",
+      }));
+    }
+  }
   await redis.connect();
   app.listen(Number(process.env.PORT || 4000), "0.0.0.0", () => console.log("SoloSync API listening"));
   worker().catch(e => console.error("publisher worker stopped", e));
