@@ -50,6 +50,54 @@ curl -X POST https://api.solosync.live/v1/connection \
   -H "Authorization: Bearer $SOLOSYNC_API_KEY"
 ```
 
+### Connection states
+
+`GET /v1/connection` reports the WAHA session status. Only `WORKING` sends.
+
+| Status | Meaning |
+|---|---|
+| `NOT_CONNECTED` | No session exists. `POST /v1/connection` creates one |
+| `STARTING` | Session coming up. Usually a few seconds |
+| `SCAN_QR_CODE` | Waiting for a phone to scan. The QR refreshes on its own |
+| `WORKING` | Paired and sending |
+| `FAILED` | WAHA could not start the session. Retry, or disconnect and pair again |
+| `STOPPED` | Session exists but is not running |
+
+Poll rather than assume: a session can leave `WORKING` at any time if someone
+unlinks the device from the phone, and SoloSync has no way to prevent that.
+`POST /v1/messages` answers `409 WHATSAPP_NOT_READY` when it happens.
+
+### Disconnect
+
+```bash
+curl -X DELETE https://api.solosync.live/v1/connection \
+  -H "Authorization: Bearer $SOLOSYNC_API_KEY"
+```
+
+Requires `connection:manage`.
+
+This **logs out** of WhatsApp — it unlinks SoloSync from the phone — then
+deletes the session. It is not the same as stopping: a stopped session is
+still paired. Sending stops until a new QR is scanned, so this is what you
+call to switch numbers or to revoke access.
+
+```json
+{ "connected": false, "status": "NOT_CONNECTED", "disconnected": true }
+```
+
+The pairing is always forgotten on SoloSync's side, even if WhatsApp does not
+confirm. If it did not, a `warnings` array is returned:
+
+```json
+{ "connected": false, "status": "NOT_CONNECTED", "disconnected": true,
+  "warnings": ["logout: request timed out"] }
+```
+
+That means the account may still appear under **Linked devices** on the phone
+and should be removed there by hand. The alternative — keeping the record
+when WhatsApp is unreachable — leaves a connection that can be neither used
+nor removed, and blocks re-pairing.
+
 ## Send a message
 
 Messages are queued asynchronously. A successful HTTP response means the publication was accepted into SoloSync's queue, not that the message has already been read.
@@ -77,8 +125,8 @@ Use `GET /v1/messages` to inspect `status`, `deliveryStatus`, `providerMessageId
 
 The current billing model is:
 
-- Account activation: **₹399**
-- Message usage: **₹0.10/message**
+- Account activation: **₹299** (one-time)
+- Message usage: **₹0.50/message**
 - Wallet top-ups: Razorpay
 - Message credit is reserved before queueing and finalized after successful publication; a final failure releases the reservation.
 

@@ -55,6 +55,26 @@ export const openapi = {
         tags: ["Connection"],
         responses: { "200": { description: "Connection and optional QR payload" }, "402": { description: "Activation required" }, "401": { description: "Invalid API key" } },
       },
+      delete: {
+        summary: "Disconnect WhatsApp and forget the pairing",
+        description:
+          "Logs out of WhatsApp, unlinking this integration from the phone, then removes the session. " +
+          "Sending stops until a new QR code is scanned. The pairing is always forgotten locally, " +
+          "so a `warnings` array means WhatsApp did not confirm the logout and the account may still " +
+          "appear under Linked devices on the phone.",
+        tags: ["Connection"],
+        responses: {
+          "200": {
+            description: "Disconnected",
+            content: { "application/json": { schema: { type: "object", properties: {
+              connected: { type: "boolean" }, status: { type: "string" }, disconnected: { type: "boolean" },
+              warnings: { type: "array", items: { type: "string" } },
+            } } } },
+          },
+          "401": { description: "Invalid API key" },
+          "403": { description: "API key lacks the connection:manage scope" },
+        },
+      },
     },
     "/v1/connection/qr": {
       get: {

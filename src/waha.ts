@@ -77,6 +77,27 @@ export class WahaClient {
     );
   }
 
+  /// Unlinks the phone, which is what "disconnect" has to mean.
+  ///
+  /// Distinct from stopSession: stopping leaves the device paired, so
+  /// starting again resumes the same WhatsApp account without a scan. Logging
+  /// out removes SoloSync from the phone's linked devices, which is both what
+  /// someone switching numbers needs and the only version that actually
+  /// revokes our access.
+  async logoutSession(name: string) {
+    return this.request(
+      `/api/sessions/${encodeURIComponent(name)}/logout`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+  }
+
+  /// Removes the session from WAHA entirely, including its stored credentials
+  /// on disk. Called after logout so a re-pair starts clean rather than
+  /// resuming half-deleted state.
+  async deleteSession(name: string) {
+    return this.request(`/api/sessions/${encodeURIComponent(name)}`, { method: "DELETE" });
+  }
+
 
   async updateSessionWebhooks(name: string) {
     if (!this.config.webhookUrl) return;
