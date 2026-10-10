@@ -451,7 +451,7 @@ export function mountAdmin(app: Express, config: AdminConfig) {
 
     const fields = describe(model);
     // Show identifying columns first; the rest are on the record itself.
-    const preferred = ["_id", "email", "name", "userId", "status", "billingStatus", "type", "kind",
+    const preferred = ["_id", "email", "name", "userId", "status", "billingStatus", "unlimitedMessages", "type", "kind",
                        "amountPaise", "balancePaise", "chatId", "phoneNumber", "sessionName", "createdAt"];
     const available = fields.map(f => f.name);
     const columns = preferred.filter(c => available.includes(c))

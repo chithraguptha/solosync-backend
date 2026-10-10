@@ -121,9 +121,22 @@ export const openapi = {
           },
         },
         responses: {
-          "202": { description: "Message queued" },
-          "402": { description: "Insufficient wallet balance" },
+          "202": { description: "Message queued. `feePaise` is 0 for accounts with unlimited messages." },
+          "402": { description: "Activation required or insufficient wallet balance (never for accounts with unlimited messages)" },
           "409": { description: "WhatsApp is not connected or ready" },
+          "401": { description: "Invalid API key" },
+        },
+      },
+    },
+    "/v1/messages/{id}": {
+      get: {
+        summary: "Get one message's status",
+        description: "Poll this after queueing to learn whether the message was published, failed, or delivered.",
+        tags: ["Messages"],
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          "200": { description: "The message: status is queued, publishing, published or failed; deliveryStatus follows WhatsApp acknowledgements" },
+          "404": { description: "No such message for this account" },
           "401": { description: "Invalid API key" },
         },
       },
