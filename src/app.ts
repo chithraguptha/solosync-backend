@@ -59,6 +59,9 @@ const User = mongoose.model("User", new Schema(
     avatarUrl: String,
     authProvider: { type: String, enum: ["password", "google", "both"], default: "password" },
     billingStatus: { type: String, enum: ["PENDING_ACTIVATION", "ACTIVE", "SUSPENDED"], default: () => env.BILLING_ENABLED ? "PENDING_ACTIVATION" : "ACTIVE" },
+    // Set by an admin for accounts that send without paying: no activation
+    // fee, no wallet, no per-message charge. Suspension still applies.
+    unlimitedMessages: { type: Boolean, default: false },
   },
   { timestamps: true },
 ));
@@ -90,6 +93,10 @@ const Publication = mongoose.model("Publication", new Schema(
     connectionId: { type: Schema.Types.ObjectId, required: true },
     chatId: { type: String, required: true, index: true },
     kind: { type: String, enum: ["text", "image", "video"], default: "text" },
+    // Decided once, when the message is queued. Reading the user's flag again
+    // at publish or failure time would let an admin toggling it mid-flight
+    // finalize or release a reservation that was never made.
+    billed: { type: Boolean, default: true },
     text: String,
     mediaUrl: String,
     status: { type: String, enum: ["queued", "publishing", "published", "failed"], default: "queued", index: true },
@@ -188,7 +195,7 @@ const access = (id: string) => jwt.sign({ sub: id, type: "access" }, env.JWT_SEC
 const refresh = (id: string) => jwt.sign({ sub: id, type: "refresh", jti: crypto.randomUUID() }, env.JWT_SECRET, { expiresIn: "7d" });
 const userView = (u: any) => ({
   id: String(u._id), email: u.email, name: u.name || u.email.split("@")[0],
-  avatarUrl: u.avatarUrl || null, authProvider: u.authProvider, billingStatus: u.billingStatus || "ACTIVE", createdAt: u.createdAt,
+  avatarUrl: u.avatarUrl || null, authProvider: u.authProvider, billingStatus: u.billingStatus || "ACTIVE", unlimitedMessages: !!u.unlimitedMessages, createdAt: u.createdAt,
 });
 
 async function issueSession(res: express.Response, userId: string) {
@@ -237,7 +244,18 @@ async function developerAuth(req: Request, requiredScope: any) {
 ///     crediting it — a payment already in flight must always be finished;
 ///   - reads and disconnect, which cost nothing.
 function owesActivation(user: any) {
-  return env.BILLING_ENABLED && user?.billingStatus !== "ACTIVE";
+  return env.BILLING_ENABLED && !user?.unlimitedMessages && user?.billingStatus !== "ACTIVE";
+}
+
+/// Whether a new message from this user is charged.
+function billable(user: any) {
+  return env.BILLING_ENABLED && !user?.unlimitedMessages;
+}
+
+/// Whether an existing message was charged when it was queued. Messages
+/// queued before the flag existed have no `billed` field and were charged.
+function wasBilled(p: any) {
+  return env.BILLING_ENABLED && p?.billed !== false;
 }
 
 function developerError(res: express.Response, error: any) {
@@ -285,7 +303,7 @@ async function markPublicationPublished(p: any, providerMessageId: string, deliv
   p.publishedAt = publishedAt || p.publishedAt || new Date();
   p.error = undefined;
   await p.save();
-  await finalizeMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+  await finalizeMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), wasBilled(p));
   await recordMessage(String(p.userId), p._id);
 }
 
@@ -377,7 +395,7 @@ async function publish(publicationId: string) {
       nextStatus: p.status,
       error: p.error,
     }));
-    if (p.status === "failed") await releaseMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+    if (p.status === "failed") await releaseMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), wasBilled(p));
     throw error;
   }
 }
@@ -442,7 +460,7 @@ async function recoverStuckPublications() {
         String(updated.userId),
         env.MESSAGE_FEE_PAISE,
         String(updated._id),
-        env.BILLING_ENABLED,
+        wasBilled(updated),
       );
       console.error(JSON.stringify({
         event: "publication.recovery_failed",
@@ -755,17 +773,18 @@ app.post("/api/whatsapp/publish", async (req, res) => {
     if (!["text", "image", "video"].includes(kind)) return res.status(400).json({ message: "Unsupported message kind" });
     const session: any = await waha.getSession(c.sessionName);
     if (session.status !== "WORKING") return res.status(409).json({ message: "WhatsApp session is not ready", status: session.status });
-    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl } as any);
-    const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+    const billed = billable(user);
+    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl, billed } as any);
+    const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), billed);
     if (!reserved) { await p.deleteOne(); return res.status(402).json({ message: "Insufficient wallet balance. Top up your wallet to send messages.", code: "INSUFFICIENT_BALANCE" }); }
     try {
       await redis.lPush("solosync:publish", JSON.stringify({ publicationId: String(p._id) }));
     } catch (error) {
-      await releaseMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+      await releaseMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), billed);
       await p.deleteOne();
       throw error;
     }
-    res.status(202).json({ publication: { id: String(p._id), status: "queued", feePaise: env.MESSAGE_FEE_PAISE } });
+    res.status(202).json({ publication: { id: String(p._id), status: "queued", feePaise: billed ? env.MESSAGE_FEE_PAISE : 0 } });
   } catch (e: any) { res.status(500).json({ message: e.message || "Unable to queue message" }); }
 });
 
@@ -877,6 +896,7 @@ app.get("/v1/account", async (req, res) => {
       billing: {
         enabled: env.BILLING_ENABLED,
         status: user.billingStatus || "ACTIVE",
+        unlimitedMessages: !!user.unlimitedMessages,
         activationFeePaise: env.ACTIVATION_FEE_PAISE,
         messageFeePaise: env.MESSAGE_FEE_PAISE,
         wallet: { balancePaise: wallet?.balancePaise || 0, reservedPaise: wallet?.reservedPaise || 0 },
@@ -990,17 +1010,34 @@ app.post("/v1/messages", async (req, res) => {
     if (!["text", "image", "video"].includes(kind)) return res.status(400).json({ error: { message: "Unsupported message kind" } });
     const session: any = await waha.getSession(c.sessionName);
     if (session.status !== "WORKING") return res.status(409).json({ error: { code: "WHATSAPP_NOT_READY", message: "WhatsApp session is not ready", status: session.status } });
-    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl } as any);
-    const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+    const billed = billable(user);
+    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl, billed } as any);
+    const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), billed);
     if (!reserved) { await p.deleteOne(); return res.status(402).json({ error: { code: "INSUFFICIENT_BALANCE", message: "Insufficient wallet balance" } }); }
     try {
       await redis.lPush("solosync:publish", JSON.stringify({ publicationId: String(p._id) }));
     } catch (error) {
-      await releaseMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), env.BILLING_ENABLED);
+      await releaseMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), billed);
       await p.deleteOne();
       throw error;
     }
-    res.status(202).json({ id: String(p._id), status: "queued", feePaise: env.MESSAGE_FEE_PAISE });
+    res.status(202).json({ id: String(p._id), status: "queued", feePaise: billed ? env.MESSAGE_FEE_PAISE : 0 });
+  } catch (e: any) { developerError(res, e); }
+});
+
+// One message's progress, for callers that need to know a send went out
+// (a verification code, for instance) rather than paging the whole list.
+app.get("/v1/messages/:id", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "messages:read");
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Message not found" } });
+    const p: any = await Publication.findOne({ _id: req.params.id, userId: user._id }).lean();
+    if (!p) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Message not found" } });
+    res.json({
+      id: String(p._id), chatId: p.chatId, kind: p.kind, status: p.status, deliveryStatus: p.deliveryStatus,
+      attempts: p.attempts, error: p.error || null, feePaise: p.billed === false ? 0 : env.MESSAGE_FEE_PAISE,
+      createdAt: p.createdAt, publishedAt: p.publishedAt || null,
+    });
   } catch (e: any) { developerError(res, e); }
 });
 
@@ -1023,7 +1060,7 @@ app.get("/api/billing/config", async (req, res) => {
   try {
     const user: any = await auth(req);
     const wallet: any = await Wallet.findOne({ userId: user._id }).lean();
-    res.json({ enabled: env.BILLING_ENABLED, keyId: env.RAZORPAY_KEY_ID || null, activationFeePaise: env.ACTIVATION_FEE_PAISE, messageFeePaise: env.MESSAGE_FEE_PAISE, billingStatus: user.billingStatus || "ACTIVE", wallet: wallet ? { balancePaise: wallet.balancePaise, reservedPaise: wallet.reservedPaise } : { balancePaise: 0, reservedPaise: 0 } });
+    res.json({ enabled: env.BILLING_ENABLED, keyId: env.RAZORPAY_KEY_ID || null, activationFeePaise: env.ACTIVATION_FEE_PAISE, messageFeePaise: env.MESSAGE_FEE_PAISE, billingStatus: user.billingStatus || "ACTIVE", unlimitedMessages: !!user.unlimitedMessages, wallet: wallet ? { balancePaise: wallet.balancePaise, reservedPaise: wallet.reservedPaise } : { balancePaise: 0, reservedPaise: 0 } });
   } catch (e:any) { res.status(401).json({ message: e.message || "Unable to read billing config" }); }
 });
 
@@ -1167,13 +1204,13 @@ app.post("/webhooks/waha", async (req, res) => {
           publication.status = "failed";
           publication.error = "WAHA message acknowledgement reported ERROR";
           await publication.save();
-          await releaseMessageCredit(String(publication.userId), env.MESSAGE_FEE_PAISE, String(publication._id), env.BILLING_ENABLED);
+          await releaseMessageCredit(String(publication.userId), env.MESSAGE_FEE_PAISE, String(publication._id), wasBilled(publication));
         } else {
           publication.status = "published";
           publication.publishedAt = publication.publishedAt || new Date();
           publication.error = undefined;
           await publication.save();
-          await finalizeMessageCredit(String(publication.userId), env.MESSAGE_FEE_PAISE, String(publication._id), env.BILLING_ENABLED);
+          await finalizeMessageCredit(String(publication.userId), env.MESSAGE_FEE_PAISE, String(publication._id), wasBilled(publication));
           await recordMessage(String(publication.userId), publication._id);
         }
       }
