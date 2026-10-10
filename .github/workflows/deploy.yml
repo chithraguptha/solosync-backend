@@ -1,0 +1,92 @@
+name: Deploy
+
+# A merge to main builds one image, pushes it to crmanvori and rolls
+# ca-solosync-api onto it, rolling back if /health stops answering.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # Azure OIDC login; no stored credential
+
+env:
+  REGISTRY: crmanvori.azurecr.io
+  REGISTRY_NAME: crmanvori
+  RESOURCE_GROUP: rg-solosync
+  APP: ca-solosync-api
+  IMAGE_REPO: solosync-backend
+  HEALTH_PATH: /health
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: meta
+        run: echo "image=${REGISTRY}/${IMAGE_REPO}:$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push
+        run: |
+          az acr login --name "$REGISTRY_NAME"
+          # Container Apps runs amd64.
+          docker build --platform linux/amd64 -t "${{ steps.meta.outputs.image }}" .
+          docker push "${{ steps.meta.outputs.image }}"
+
+      # Remembered before anything changes, so a failed health check has
+      # somewhere to go back to.
+      - name: Note what is running now
+        id: current
+        run: |
+          previous=$(az containerapp show -n "$APP" -g "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].image" -o tsv)
+          echo "image=$previous" >> "$GITHUB_OUTPUT"
+          echo "currently running: $previous"
+
+      - name: Roll the app onto it
+        run: az containerapp update -n "$APP" -g "$RESOURCE_GROUP" --image "${{ steps.meta.outputs.image }}" -o none
+
+      # "The command returned" is not "the app is up". A wall-clock deadline,
+      # so the message at the end is true.
+      - name: Wait for it to answer
+        run: |
+          fqdn=$(az containerapp show -n "$APP" -g "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          deadline=$(( SECONDS + 300 )); attempt=0
+          until [ "$SECONDS" -ge "$deadline" ]; do
+            attempt=$(( attempt + 1 ))
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://${fqdn}${HEALTH_PATH}" || true)
+            if [ "$code" = "200" ]; then echo "healthy after ${attempt} attempt(s), ${SECONDS}s"; exit 0; fi
+            echo "attempt ${attempt} at ${SECONDS}s: HTTP ${code}"; sleep 10
+          done
+          echo "::error::no healthy response in 5 minutes"; exit 1
+
+      - name: Put the old image back
+        if: failure() && steps.current.outputs.image != ''
+        run: |
+          echo "::warning::rolling back to ${{ steps.current.outputs.image }}"
+          az containerapp update -n "$APP" -g "$RESOURCE_GROUP" --image "${{ steps.current.outputs.image }}" -o none
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image | \`${{ steps.meta.outputs.image }}\` |"
+            echo "| previous | \`${{ steps.current.outputs.image }}\` |"
+            echo "| result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
