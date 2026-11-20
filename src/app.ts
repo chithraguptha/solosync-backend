@@ -17,6 +17,7 @@ import {
 } from "./billing";
 import { mountAdmin } from "./admin";
 import { CouponError, previewCoupon, redeemCoupon } from "./coupons";
+import { Receipt, backfillReceipts, issueReceipt, receiptHtml } from "./receipts";
 import { openapi } from "./openapi";
 import { API_KEY_SCOPES, authenticateApiKey, createApiKey, hasApiKeyScope, listApiKeys, revokeApiKey, rotateApiKey } from "./apiKeys";
 
@@ -37,6 +38,14 @@ const env = {
   BILLING_ENABLED: process.env.BILLING_ENABLED === "true",
   ACTIVATION_FEE_PAISE: Number(process.env.ACTIVATION_FEE_PAISE || 29900),
   MESSAGE_FEE_PAISE: Number(process.env.MESSAGE_FEE_PAISE || 50),
+  // Per-message price for accounts allowed more than one WhatsApp number.
+  MULTI_MESSAGE_FEE_PAISE: Number(process.env.MULTI_MESSAGE_FEE_PAISE || 100),
+  // Each WhatsApp number is a browser session on the WAHA host. 0 = no cap;
+  // set it to what the host can hold so one account cannot exhaust it.
+  WAHA_SESSION_CAPACITY: Number(process.env.WAHA_SESSION_CAPACITY || 0),
+  RECEIPT_SELLER_NAME: process.env.RECEIPT_SELLER_NAME || "SoloSync",
+  RECEIPT_SELLER_ADDRESS: process.env.RECEIPT_SELLER_ADDRESS || "",
+  RECEIPT_SELLER_EMAIL: process.env.RECEIPT_SELLER_EMAIL || "",
   RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || "",
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || "",
   RAZORPAY_WEBHOOK_SECRET: process.env.RAZORPAY_WEBHOOK_SECRET || "",
@@ -68,13 +77,25 @@ const User = mongoose.model("User", new Schema(
     customActivationFeePaise: { type: Number, min: 0 },
     customMessageFeePaise: { type: Number, min: 0 },
     couponCode: String,
+    // More than one WhatsApp number on the account. Enabled by an admin or a
+    // coupon; messages from such an account use the multi-number price.
+    multiNumberEnabled: { type: Boolean, default: false },
+    maxConnections: { type: Number, default: 5, min: 1 },
+    customMultiMessageFeePaise: { type: Number, min: 0 },
   },
   { timestamps: true },
 ));
 
 const WhatsappConnection = mongoose.model("WhatsappConnection", new Schema(
   {
-    userId: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+    // Not unique: an account with multi-number enabled holds several. The
+    // partial index below allows exactly one default per account.
+    userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    // The number used when a send does not name one. Connections created
+    // before multi-number have no flag; defaultConnection falls back to the
+    // oldest, which for them is the only one.
+    isDefault: { type: Boolean, default: false },
+    label: String,
     provider: { type: String, default: "waha" },
     sessionName: { type: String, required: true, unique: true },
     status: { type: String, default: "STOPPED" },
@@ -91,7 +112,7 @@ const WhatsappConnection = mongoose.model("WhatsappConnection", new Schema(
     activationRecorded: { type: Boolean, default: false },
   },
   { timestamps: true },
-));
+).index({ userId: 1, isDefault: 1 }, { unique: true, partialFilterExpression: { isDefault: true }, name: "one_default_per_user" }));
 
 const Publication = mongoose.model("Publication", new Schema(
   {
@@ -225,7 +246,99 @@ async function auth(req: Request) {
   return user;
 }
 
-const connectionFor = (id: string) => WhatsappConnection.findOne({ userId: id });
+/// The account's default connection, or one it names. A connection id that
+/// does not belong to the account resolves to nothing, never to another
+/// account's session.
+async function connectionFor(userId: string, connectionId?: unknown) {
+  if (connectionId) {
+    if (!mongoose.isValidObjectId(String(connectionId))) return null;
+    return WhatsappConnection.findOne({ _id: String(connectionId), userId });
+  }
+  return (await WhatsappConnection.findOne({ userId, isDefault: true }))
+    || WhatsappConnection.findOne({ userId }).sort({ createdAt: 1 });
+}
+
+/// Resolves the sender for an API send: `connectionId`, or `from` as the
+/// phone number in any common format (+91 98765 43210, 919876543210).
+async function senderFor(userId: string, body: any) {
+  if (body?.connectionId) return connectionFor(userId, body.connectionId);
+  if (body?.from) {
+    const digits = String(body.from).replace(/\D/g, "");
+    if (!digits) return null;
+    return WhatsappConnection.findOne({ userId, phoneNumber: digits });
+  }
+  return connectionFor(userId);
+}
+
+const connectionView = (c: any) => ({
+  id: String(c._id), phoneNumber: c.phoneNumber || null, pushName: c.pushName || null, label: c.label || null,
+  isDefault: !!c.isDefault, status: c.status, sessionName: c.sessionName, error: c.error || null, createdAt: c.createdAt,
+});
+
+/// Marks one connection the default, clearing the rest. Unset first so the
+/// one-default index is never violated mid-way.
+async function setDefaultConnection(userId: string, connectionId: any) {
+  await WhatsappConnection.updateMany({ userId, _id: { $ne: connectionId } }, { $set: { isDefault: false } });
+  await WhatsappConnection.updateOne({ _id: connectionId, userId }, { $set: { isDefault: true } });
+}
+
+/// After a disconnect, keeps the account with a default if it has any
+/// numbers left.
+async function ensureDefaultConnection(userId: string) {
+  if (await WhatsappConnection.exists({ userId, isDefault: true })) return;
+  const oldest: any = await WhatsappConnection.findOne({ userId }).sort({ createdAt: 1 });
+  if (oldest) await setDefaultConnection(userId, oldest._id);
+}
+
+class ConnectionLimitError extends Error {
+  constructor(public code: string, message: string, public statusCode: number) { super(message); }
+}
+
+/// Creates and starts a WAHA session for a new number. The first number
+/// keeps the historic session name, so an account that disconnects and
+/// re-pairs lands on the same WAHA session as before.
+async function createConnection(user: any, label?: string) {
+  const userId = String(user._id);
+  const count = await WhatsappConnection.countDocuments({ userId });
+  if (count >= 1 && !user.multiNumberEnabled) {
+    throw new ConnectionLimitError("MULTI_NUMBER_DISABLED", "This account can connect one WhatsApp number. Contact support to enable multiple numbers.", 403);
+  }
+  if (count >= (user.maxConnections || 5)) {
+    throw new ConnectionLimitError("CONNECTION_LIMIT", `This account can connect up to ${user.maxConnections || 5} WhatsApp numbers.`, 409);
+  }
+  if (env.WAHA_SESSION_CAPACITY > 0 && await WhatsappConnection.estimatedDocumentCount() >= env.WAHA_SESSION_CAPACITY) {
+    throw new ConnectionLimitError("CAPACITY", "No WhatsApp capacity is free right now. Try again later or contact support.", 503);
+  }
+  // An account paired before multi-number has one connection with no
+  // default flag. Mark it now, so the number it already sends from stays the
+  // default rather than the one being added.
+  if (count > 0) await ensureDefaultConnection(userId);
+  const taken = await WhatsappConnection.exists({ sessionName: "user_" + userId });
+  const sessionName = taken ? "user_" + userId + "_" + crypto.randomBytes(4).toString("hex") : "user_" + userId;
+  try { await waha.createSession(sessionName); } catch (e: any) { if (!String(e.message).includes("already")) throw e; }
+  try { await waha.startSession(sessionName); } catch (e: any) { throw Error("WAHA could not start the session: " + String(e.message || e)); }
+  const c: any = await WhatsappConnection.create({
+    userId: user._id, sessionName, status: "STARTING", isDefault: count === 0,
+    label: label ? String(label).slice(0, 60) : undefined,
+  });
+  return c;
+}
+
+/// Logs out and deletes a session. Best-effort against WAHA: the local
+/// record is always cleared (see the dashboard disconnect route).
+async function removeConnection(c: any) {
+  const warnings: string[] = [];
+  for (const [step, run] of [
+    ["logout", () => waha.logoutSession(c.sessionName)],
+    ["delete", () => waha.deleteSession(c.sessionName)],
+  ] as const) {
+    try { await run(); }
+    catch (e: any) { warnings.push(`${step}: ${e?.message || "failed"}`); }
+  }
+  await c.deleteOne();
+  await ensureDefaultConnection(String(c.userId));
+  return warnings;
+}
 
 async function developerAuth(req: Request, requiredScope: any) {
   const header = String(req.header("authorization") || "");
@@ -275,6 +388,7 @@ function activationFeeFor(user: any) {
 
 /// The price of one message for this account.
 function messageFeeFor(user: any) {
+  if (user?.multiNumberEnabled) return user?.customMultiMessageFeePaise ?? env.MULTI_MESSAGE_FEE_PAISE;
   return user?.customMessageFeePaise ?? env.MESSAGE_FEE_PAISE;
 }
 
@@ -441,8 +555,10 @@ async function applySessionIdentity(c: any, session: any): Promise<string | null
       phoneNumber: phone, _id: { $ne: c._id },
     }).lean();
     if (other) {
-      const message = `WhatsApp number +${phone} is already connected to another SoloSync account. ` +
-        `Disconnect it there first, or pair a different number.`;
+      const message = String(other.userId) === String(c.userId)
+        ? `WhatsApp number +${phone} is already connected on this account. Use that connection, or pair a different number.`
+        : `WhatsApp number +${phone} is already connected to another SoloSync account. ` +
+          `Disconnect it there first, or pair a different number.`;
       c.status = "FAILED";
       c.error = message;
       c.lastErrorAt = new Date();
@@ -688,12 +804,13 @@ app.post("/api/whatsapp/connect", async (req, res) => {
     const user: any = await auth(req);
     if (user.billingStatus === "SUSPENDED") return res.status(403).json({ message: "Account is suspended" });
     if (owesActivation(user)) return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
-    let c: any = await connectionFor(String(user._id));
+    // add: true pairs another number; connectionId resumes a specific one;
+    // neither resumes the default, creating it the first time.
+    let c: any = req.body?.add ? null : await connectionFor(String(user._id), req.body?.connectionId);
+    if (!c && req.body?.connectionId) return res.status(404).json({ message: "WhatsApp number not found" });
     if (!c) {
-      const sessionName = "user_" + String(user._id);
-      try { await waha.createSession(sessionName); } catch (e: any) { if (!String(e.message).includes("already")) throw e; }
-      try { await waha.startSession(sessionName); } catch (e: any) { throw Error("WAHA could not start the session: " + String(e.message || e)); }
-      c = await WhatsappConnection.create({ userId: user._id, sessionName, status: "STARTING" });
+      try { c = await createConnection(user, req.body?.label); }
+      catch (e: any) { if (e instanceof ConnectionLimitError) return res.status(e.statusCode).json({ message: e.message, code: e.code }); throw e; }
       if (!env.BILLING_ENABLED) await recordActivation(String(user._id), c);
     } else {
       let current: any;
@@ -723,7 +840,7 @@ app.post("/api/whatsapp/connect", async (req, res) => {
 
 app.get("/api/whatsapp/status", async (req, res) => {
   try {
-    const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    const user: any = await auth(req), c: any = await connectionFor(String(user._id), req.query.connectionId);
     if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
     const session: any = await waha.getSession(c.sessionName);
     c.status = session.status || c.status;
@@ -746,19 +863,10 @@ app.get("/api/whatsapp/status", async (req, res) => {
 /// (connect creates a fresh one); the reverse is a dead end.
 app.post("/api/whatsapp/disconnect", async (req, res) => {
   try {
-    const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    const user: any = await auth(req), c: any = await connectionFor(String(user._id), req.body?.connectionId);
     if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
 
-    const warnings: string[] = [];
-    for (const [step, run] of [
-      ["logout", () => waha.logoutSession(c.sessionName)],
-      ["delete", () => waha.deleteSession(c.sessionName)],
-    ] as const) {
-      try { await run(); }
-      catch (e: any) { warnings.push(`${step}: ${e?.message || "failed"}`); }
-    }
-
-    await c.deleteOne();
+    const warnings = await removeConnection(c);
     res.json({
       connected: false,
       status: "NOT_CONNECTED",
@@ -773,7 +881,7 @@ app.post("/api/whatsapp/disconnect", async (req, res) => {
 
 app.get("/api/whatsapp/qr", async (req, res) => {
   try {
-    const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    const user: any = await auth(req), c: any = await connectionFor(String(user._id), req.query.connectionId);
     if (!c) return res.status(404).json({ message: "Connect WhatsApp first" });
     res.json(await waha.getQr(c.sessionName));
   } catch (e: any) { res.status(502).json({ message: e.message || "Unable to get QR code" }); }
@@ -781,17 +889,49 @@ app.get("/api/whatsapp/qr", async (req, res) => {
 
 app.get("/api/whatsapp/channels", async (req, res) => {
   try {
-    const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    const user: any = await auth(req), c: any = await connectionFor(String(user._id), req.query.connectionId);
     if (!c) return res.status(404).json({ message: "Connect WhatsApp first" });
     res.json({ channels: await waha.getChannels(c.sessionName) });
   } catch (e: any) { res.status(502).json({ message: e.message || "Unable to list channels" }); }
 });
 
+/// Every number on the account, default first. Statuses are as last seen;
+/// the status route refreshes one from WAHA.
+app.get("/api/whatsapp/connections", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    const rows = await WhatsappConnection.find({ userId: user._id }).sort({ isDefault: -1, createdAt: 1 });
+    res.json({
+      connections: rows.map(connectionView),
+      multiNumberEnabled: !!user.multiNumberEnabled, maxConnections: user.maxConnections || 5,
+    });
+  } catch (e: any) { res.status(401).json({ message: e.message || "Unable to list WhatsApp numbers" }); }
+});
+
+app.post("/api/whatsapp/connections/:id/default", async (req, res) => {
+  try {
+    const user: any = await auth(req), c: any = await connectionFor(String(user._id), req.params.id);
+    if (!c) return res.status(404).json({ message: "WhatsApp number not found" });
+    await setDefaultConnection(String(user._id), c._id);
+    res.json({ ok: true, defaultConnectionId: String(c._id) });
+  } catch (e: any) { res.status(400).json({ message: e.message || "Unable to change the default number" }); }
+});
+
+app.patch("/api/whatsapp/connections/:id", async (req, res) => {
+  try {
+    const user: any = await auth(req), c: any = await connectionFor(String(user._id), req.params.id);
+    if (!c) return res.status(404).json({ message: "WhatsApp number not found" });
+    c.label = req.body?.label ? String(req.body.label).slice(0, 60) : undefined;
+    await c.save();
+    res.json({ connection: connectionView(c) });
+  } catch (e: any) { res.status(400).json({ message: e.message || "Unable to rename the number" }); }
+});
+
 app.post("/api/whatsapp/publish", async (req, res) => {
   try {
-    const user: any = await auth(req), c: any = await connectionFor(String(user._id));
+    const user: any = await auth(req), c: any = await senderFor(String(user._id), req.body);
     if (owesActivation(user)) return res.status(402).json({ message: "Activation payment required", code: "ACTIVATION_REQUIRED" });
-    if (!c) return res.status(400).json({ message: "Connect WhatsApp first" });
+    if (!c) return res.status(400).json({ message: req.body?.from || req.body?.connectionId ? "That WhatsApp number is not connected to this account" : "Connect WhatsApp first" });
     const chatId = String(req.body.chatId || "").trim(), text = String(req.body.text || "");
     const kind = String(req.body.kind || "text"), mediaUrl = req.body.mediaUrl ? String(req.body.mediaUrl) : undefined;
     if (!chatId || (!text && !mediaUrl)) return res.status(400).json({ message: "chatId and text/media are required" });
@@ -940,7 +1080,74 @@ app.get("/v1/connection", async (req, res) => {
     const identityError = await applySessionIdentity(c, session);
     if (identityError) return res.json({ connected: false, status: "FAILED", error: { code: "NUMBER_IN_USE", message: identityError } });
     await c.save();
-    res.json({ connected: session.status === "WORKING", status: session.status, connection: { phoneNumber: c.phoneNumber || null, pushName: c.pushName || null, sessionName: c.sessionName } });
+    res.json({ connected: session.status === "WORKING", status: session.status, connection: { id: String(c._id), phoneNumber: c.phoneNumber || null, pushName: c.pushName || null, sessionName: c.sessionName, isDefault: true } });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.get("/v1/connections", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:read");
+    const rows = await WhatsappConnection.find({ userId: user._id }).sort({ isDefault: -1, createdAt: 1 });
+    res.json({ connections: rows.map(connectionView), multiNumberEnabled: !!user.multiNumberEnabled, maxConnections: user.maxConnections || 5 });
+  } catch (e: any) { developerError(res, e); }
+});
+
+/// Pairs another number. Needs multi-number enabled on the account.
+app.post("/v1/connections", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:manage");
+    if (owesActivation(user)) return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
+    let c: any;
+    try { c = await createConnection(user, req.body?.label); }
+    catch (e: any) { if (e instanceof ConnectionLimitError) return res.status(e.statusCode).json({ error: { code: e.code, message: e.message } }); throw e; }
+    let session: any = await waha.getSession(c.sessionName);
+    c.status = session.status || c.status; await c.save();
+    let qr: any = null;
+    if (session.status === "SCAN_QR_CODE") { try { qr = await waha.getQr(c.sessionName); } catch {} }
+    res.status(201).json({ connected: session.status === "WORKING", status: session.status, connection: connectionView(c), qr });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.get("/v1/connections/:id", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:read");
+    const c: any = await connectionFor(String(user._id), req.params.id);
+    if (!c) return res.status(404).json({ error: { code: "NOT_FOUND", message: "WhatsApp number not found" } });
+    const session: any = await waha.getSession(c.sessionName);
+    c.status = session.status || c.status;
+    const identityError = await applySessionIdentity(c, session);
+    if (identityError) return res.json({ connected: false, status: "FAILED", connection: connectionView(c), error: { code: "NUMBER_IN_USE", message: identityError } });
+    await c.save();
+    res.json({ connected: session.status === "WORKING", status: session.status, connection: connectionView(c) });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.get("/v1/connections/:id/qr", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:manage");
+    const c: any = await connectionFor(String(user._id), req.params.id);
+    if (!c) return res.status(404).json({ error: { code: "NOT_FOUND", message: "WhatsApp number not found" } });
+    res.json(await waha.getQr(c.sessionName));
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.post("/v1/connections/:id/default", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:manage");
+    const c: any = await connectionFor(String(user._id), req.params.id);
+    if (!c) return res.status(404).json({ error: { code: "NOT_FOUND", message: "WhatsApp number not found" } });
+    await setDefaultConnection(String(user._id), c._id);
+    res.json({ ok: true, defaultConnectionId: String(c._id) });
+  } catch (e: any) { developerError(res, e); }
+});
+
+app.delete("/v1/connections/:id", async (req, res) => {
+  try {
+    const { user } = await developerAuth(req, "connection:manage");
+    const c: any = await connectionFor(String(user._id), req.params.id);
+    if (!c) return res.status(404).json({ error: { code: "NOT_FOUND", message: "WhatsApp number not found" } });
+    const warnings = await removeConnection(c);
+    res.json({ disconnected: true, warnings: warnings.length ? warnings : undefined });
   } catch (e: any) { developerError(res, e); }
 });
 
@@ -952,16 +1159,7 @@ app.delete("/v1/connection", async (req, res) => {
     const c: any = await connectionFor(String(user._id));
     if (!c) return res.json({ connected: false, status: "NOT_CONNECTED" });
 
-    const warnings: string[] = [];
-    for (const [step, run] of [
-      ["logout", () => waha.logoutSession(c.sessionName)],
-      ["delete", () => waha.deleteSession(c.sessionName)],
-    ] as const) {
-      try { await run(); }
-      catch (e: any) { warnings.push(`${step}: ${e?.message || "failed"}`); }
-    }
-
-    await c.deleteOne();
+    const warnings = await removeConnection(c);
     res.json({ connected: false, status: "NOT_CONNECTED", disconnected: true, warnings: warnings.length ? warnings : undefined });
   } catch (e: any) { developerError(res, e); }
 });
@@ -972,10 +1170,7 @@ app.post("/v1/connection", async (req, res) => {
     if (owesActivation(user)) return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
     let c: any = await connectionFor(String(user._id));
     if (!c) {
-      const sessionName = "user_" + String(user._id);
-      try { await waha.createSession(sessionName); } catch (e: any) { if (!String(e.message).includes("already")) throw e; }
-      try { await waha.startSession(sessionName); } catch {}
-      c = await WhatsappConnection.create({ userId: user._id, sessionName, status: "STARTING" });
+      c = await createConnection(user);
       if (!env.BILLING_ENABLED) await recordActivation(String(user._id), c);
     } else {
       try { await waha.startSession(c.sessionName); } catch {}
@@ -1025,7 +1220,10 @@ app.post("/v1/messages", async (req, res) => {
   try {
     const { user } = await developerAuth(req, "messages:send");
     if (owesActivation(user)) return res.status(402).json({ error: { code: "ACTIVATION_REQUIRED", message: "Activation payment required" } });
-    const c: any = await connectionFor(String(user._id));
+    // `from` (a phone number) or `connectionId` picks the sending number;
+    // without either the account's default sends.
+    const c: any = await senderFor(String(user._id), req.body);
+    if (!c && (req.body?.from || req.body?.connectionId)) return res.status(404).json({ error: { code: "SENDER_NOT_FOUND", message: "That WhatsApp number is not connected to this account" } });
     if (!c) return res.status(409).json({ error: { code: "NOT_CONNECTED", message: "Connect WhatsApp first" } });
     const chatId = String(req.body?.chatId || "").trim();
     const text = String(req.body?.text || "");
@@ -1059,7 +1257,7 @@ app.get("/v1/messages/:id", async (req, res) => {
     const p: any = await Publication.findOne({ _id: req.params.id, userId: user._id }).lean();
     if (!p) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Message not found" } });
     res.json({
-      id: String(p._id), chatId: p.chatId, kind: p.kind, status: p.status, deliveryStatus: p.deliveryStatus,
+      id: String(p._id), chatId: p.chatId, connectionId: String(p.connectionId), kind: p.kind, status: p.status, deliveryStatus: p.deliveryStatus,
       attempts: p.attempts, error: p.error || null, feePaise: p.billed === false ? 0 : feeOf(p),
       createdAt: p.createdAt, publishedAt: p.publishedAt || null,
     });
@@ -1120,6 +1318,7 @@ app.post("/api/billing/activation/verify", async (req,res) => {
     const captured:any=await processCapturedPayment(razorpay_payment_id);
     captured.razorpaySignature=razorpay_signature; await captured.save();
     user.billingStatus="ACTIVE"; await user.save();
+    await issueReceiptSafely(captured);
     if (!(await BillingLedger.exists({ userId:user._id, kind:"activation" }))) await BillingLedger.create({userId:user._id,kind:"activation",units:1,amountPaise:p.amountPaise,status:"recorded",note:"Razorpay Checkout verified"});
     res.json({ok:true,billingStatus:"ACTIVE"});
   }catch(e:any){res.status(400).json({message:e.message||"Payment verification failed"});}
@@ -1146,6 +1345,7 @@ app.post("/api/billing/wallet/verify", async(req,res)=>{
     const captured:any=await processCapturedPayment(razorpay_payment_id);
     captured.razorpaySignature=razorpay_signature; await captured.save();
     if(captured.status==="captured") await creditWallet(String(user._id),p.amountPaise,String(p._id));
+    await issueReceiptSafely(captured);
     const wallet:any=await Wallet.findOne({userId:user._id}).lean();
     res.json({ok:true,wallet:{balancePaise:wallet?.balancePaise||0,reservedPaise:wallet?.reservedPaise||0}});
   }catch(e:any){res.status(400).json({message:e.message||"Wallet payment verification failed"});}
@@ -1167,6 +1367,37 @@ app.post("/api/billing/wallet/test-credit", async(req,res)=>{
 app.get("/api/billing/wallet", async(req,res)=>{
   try{const user:any=await auth(req);const wallet:any=await Wallet.findOne({userId:user._id}).lean();const transactions=await WalletTransaction.find({userId:user._id}).sort({createdAt:-1}).limit(100).lean();res.json({wallet:{balancePaise:wallet?.balancePaise||0,reservedPaise:wallet?.reservedPaise||0},transactions});}
   catch(e:any){res.status(401).json({message:e.message||"Unable to read wallet"});}
+});
+
+// Receipts
+const seller = () => ({ name: env.RECEIPT_SELLER_NAME, address: env.RECEIPT_SELLER_ADDRESS, email: env.RECEIPT_SELLER_EMAIL });
+
+/// A receipt failure must never fail the payment confirmation around it:
+/// the money has moved and the wallet must be credited. The list route
+/// backfills anything missed.
+async function issueReceiptSafely(payment: any) {
+  try { await issueReceipt(payment, seller()); }
+  catch (e: any) { console.error(JSON.stringify({ event: "receipt.issue_failed", paymentId: String(payment?._id), message: e?.message })); }
+}
+
+app.get("/api/billing/receipts", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    await backfillReceipts(user._id, seller());
+    const rows = await Receipt.find({ userId: user._id }).sort({ issuedAt: -1 }).limit(200).lean();
+    res.json({ receipts: rows.map((r: any) => ({ id: String(r._id), number: r.number, description: r.description, amountPaise: r.amountPaise, currency: r.currency, issuedAt: r.issuedAt, url: env.API_BASE_URL + "/api/billing/receipts/" + String(r._id) })) });
+  } catch (e: any) { res.status(401).json({ message: e.message || "Unable to list receipts" }); }
+});
+
+/// Opened in a new tab from the dashboard, so it answers with a page, not
+/// JSON, and authenticates with the same session cookie.
+app.get("/api/billing/receipts/:id", async (req, res) => {
+  let user: any;
+  try { user = await auth(req); } catch { return res.status(401).type("text").send("Sign in to the SoloSync dashboard to view this receipt."); }
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).type("text").send("Receipt not found");
+  const r = await Receipt.findOne({ _id: req.params.id, userId: user._id }).lean();
+  if (!r) return res.status(404).type("text").send("Receipt not found");
+  res.type("html").set("Cache-Control", "private, no-store").send(receiptHtml(r));
 });
 
 // Coupons
@@ -1206,6 +1437,7 @@ app.post("/webhooks/razorpay", async(req,res)=>{
     const payment=req.body?.payload?.payment?.entity;
     if(payment && (event==="payment.captured" || event==="order.paid")){
       const p:any=await markPaymentCaptured(payment);
+      await issueReceiptSafely(p);
       if(p.type==="activation"){
         await mongoose.model("User").findByIdAndUpdate(p.userId,{billingStatus:"ACTIVE"});
         if (!(await BillingLedger.exists({userId:p.userId,kind:"activation"}))) await BillingLedger.create({userId:p.userId,kind:"activation",units:1,amountPaise:p.amountPaise,status:"recorded",note:"Razorpay webhook captured"});

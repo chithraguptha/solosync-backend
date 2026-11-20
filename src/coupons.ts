@@ -17,6 +17,11 @@ export const Coupon = mongoose.model("Coupon", new Schema(
     messageFeePaise: { type: Number, default: null, min: 0 },
     walletCreditPaise: { type: Number, default: 0, min: 0 },
     unlimitedMessages: { type: Boolean, default: false },
+    // Lets the account connect several WhatsApp numbers, at multiMessageFeePaise
+    // per message (null = the standard multi-number price).
+    multiNumberEnabled: { type: Boolean, default: false },
+    maxConnections: { type: Number, default: null, min: 1 },
+    multiMessageFeePaise: { type: Number, default: null, min: 0 },
     // null means no cap.
     maxRedemptions: { type: Number, default: null, min: 1 },
     redemptionCount: { type: Number, default: 0 },
@@ -75,11 +80,14 @@ export async function createCoupon(input: any) {
     messageFeePaise: optionalPaise(input?.messageFeePaise, "messageFeePaise"),
     walletCreditPaise: optionalPaise(input?.walletCreditPaise, "walletCreditPaise") || 0,
     unlimitedMessages: input?.unlimitedMessages === true || input?.unlimitedMessages === "true",
+    multiNumberEnabled: input?.multiNumberEnabled === true || input?.multiNumberEnabled === "true",
+    maxConnections: input?.maxConnections ? Math.max(1, Math.round(Number(input.maxConnections))) : null,
+    multiMessageFeePaise: optionalPaise(input?.multiMessageFeePaise, "multiMessageFeePaise"),
     maxRedemptions: input?.maxRedemptions ? Math.max(1, Math.round(Number(input.maxRedemptions))) : null,
     expiresAt: input?.expiresAt ? new Date(input.expiresAt) : null,
   };
   if (doc.expiresAt && isNaN(doc.expiresAt.getTime())) throw new CouponError("INVALID", "expiresAt must be a date");
-  if (doc.activationFeePaise === null && doc.messageFeePaise === null && !doc.walletCreditPaise && !doc.unlimitedMessages) {
+  if (doc.activationFeePaise === null && doc.messageFeePaise === null && !doc.walletCreditPaise && !doc.unlimitedMessages && !doc.multiNumberEnabled) {
     throw new CouponError("INVALID", "A coupon needs at least one benefit");
   }
   try { return await Coupon.create(doc); }
@@ -105,6 +113,9 @@ export function couponView(coupon: any) {
     messageFeePaise: coupon.messageFeePaise ?? null,
     walletCreditPaise: coupon.walletCreditPaise || 0,
     unlimitedMessages: !!coupon.unlimitedMessages,
+    multiNumberEnabled: !!coupon.multiNumberEnabled,
+    maxConnections: coupon.maxConnections ?? null,
+    multiMessageFeePaise: coupon.multiMessageFeePaise ?? null,
     expiresAt: coupon.expiresAt || null,
   };
 }
@@ -154,6 +165,11 @@ export async function redeemCoupon(code: unknown, user: any) {
     if (coupon.activationFeePaise === 0 && user.billingStatus === "PENDING_ACTIVATION") $set.billingStatus = "ACTIVE";
   }
   if (coupon.messageFeePaise != null) $set.customMessageFeePaise = coupon.messageFeePaise;
+  if (coupon.multiNumberEnabled) {
+    $set.multiNumberEnabled = true;
+    if (coupon.maxConnections != null) $set.maxConnections = coupon.maxConnections;
+    if (coupon.multiMessageFeePaise != null) $set.customMultiMessageFeePaise = coupon.multiMessageFeePaise;
+  }
   if (coupon.unlimitedMessages) { $set.unlimitedMessages = true; if (user.billingStatus === "PENDING_ACTIVATION") $set.billingStatus = "ACTIVE"; }
   await mongoose.model("User").updateOne({ _id: user._id }, { $set });
 
