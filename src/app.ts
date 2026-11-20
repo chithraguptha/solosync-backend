@@ -764,6 +764,7 @@ app.get("/api/auth/google/callback", async (req, res) => {
     if (!payload?.sub || !payload.email || payload.email_verified !== true) throw Error("Google account could not be verified");
 
     let user: any = await User.findOne({ $or: [{ googleId: payload.sub }, { email: payload.email.toLowerCase() }] });
+    const isNew = !user;
     if (!user) {
       user = await User.create({
         email: payload.email.toLowerCase(),
@@ -781,7 +782,9 @@ app.get("/api/auth/google/callback", async (req, res) => {
     }
 
     await issueSession(res, String(user._id));
-    res.redirect(env.FRONTEND_ORIGIN);
+    // New accounts land on /welcome, the URL the dashboard reports to Google
+    // Ads as a sign-up. Email sign-up goes there too, from the dashboard.
+    res.redirect(env.FRONTEND_ORIGIN + (isNew ? "/welcome" : ""));
   } catch (e: any) {
     const message = encodeURIComponent(e.message || "Google sign-in failed");
     res.redirect(env.FRONTEND_ORIGIN + "?auth_error=" + message);
