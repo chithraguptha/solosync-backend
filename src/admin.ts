@@ -1,7 +1,10 @@
 import { Express, Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
+import { Coupon, CouponError, createCoupon } from "./coupons";
 
-export type AdminConfig = { email: string; password: string };
+/// shareBase is the dashboard origin a coupon link opens, e.g.
+/// https://app.solosync.live.
+export type AdminConfig = { email: string; password: string; shareBase?: string };
 
 function unauthorized(res: Response) {
   res.set("WWW-Authenticate", 'Basic realm="SoloSync Admin"');
@@ -145,13 +148,16 @@ input:focus,select:focus,textarea:focus{border-color:#6a7686}
 .scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:19;display:none}.scrim.open{display:block}
 .pager{display:flex;gap:10px;align-items:center;justify-content:center;padding-top:12px;color:#7f8a9c;font-size:12px}
 section{display:none}section.active{display:block}
+.form{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.form .field{margin:0}.form .wide{grid-column:span 2}
+.link{font-family:ui-monospace,monospace;font-size:11px;color:#b9c5d4}
 .empty{padding:26px;text-align:center;color:#6f7b8d;font-size:12px}
-@media(max-width:900px){nav{position:static;width:auto}main{margin:0;padding:16px}.cards{grid-template-columns:1fr 1fr}}
+@media(max-width:900px){nav{position:static;width:auto}main{margin:0;padding:16px}.cards{grid-template-columns:1fr 1fr}.form{grid-template-columns:1fr 1fr}}
 </style></head>
 <body>
 <nav>
   <div class="brand">SoloSync<small>ADMIN CONSOLE</small></div>
   <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="coupons">Coupons</button>
   <div class="navlabel">DATABASE</div>
   <div id="collections"></div>
 </nav>
@@ -164,6 +170,24 @@ section{display:none}section.active{display:block}
   <section id="overview" class="active">
     <div class="cards" id="cards"></div>
     <div class="panel"><h2>System</h2><div id="system" class="muted"></div></div>
+  </section>
+  <section id="coupons">
+    <div class="panel">
+      <h2>Create a coupon</h2>
+      <p class="muted" style="margin-top:-6px">Leave a price blank to keep the standard one. Prices are in rupees; 0 makes it free. Pricing stays on the account after the coupon expires.</p>
+      <div class="form">
+        <label class="field"><span>Code (blank to generate)</span><input id="c-code" placeholder="LAUNCH50" maxlength="32"></label>
+        <label class="field wide"><span>Description</span><input id="c-desc" placeholder="Launch partners: free setup, ₹0.25 a message"></label>
+        <label class="field"><span>Unlimited messages</span><select id="c-unl"><option value="false">No</option><option value="true">Yes</option></select></label>
+        <label class="field"><span>Activation fee (₹)</span><input id="c-act" type="number" min="0" step="1" placeholder="standard"></label>
+        <label class="field"><span>Per-message price (₹)</span><input id="c-msg" type="number" min="0" step="0.01" placeholder="standard"></label>
+        <label class="field"><span>Wallet credit (₹)</span><input id="c-wallet" type="number" min="0" step="1" placeholder="0"></label>
+        <label class="field"><span>Max redemptions</span><input id="c-max" type="number" min="1" step="1" placeholder="no limit"></label>
+        <label class="field"><span>Expires</span><input id="c-exp" type="date"></label>
+      </div>
+      <div class="row" style="margin-top:12px"><button class="btn" id="c-create">Create coupon</button><span class="muted" id="c-made"></span></div>
+    </div>
+    <div class="panel"><h2>Coupons</h2><div class="tablewrap" id="c-table"></div></div>
   </section>
   <section id="browser">
     <div class="panel">
@@ -346,6 +370,81 @@ async function deleteDoc(){
   }catch(e){ showErr(e.message) }
 }
 
+var rupees=function(p){return p==null?'<span class="muted">standard</span>':(Number(p)===0?"Free":money(p))};
+var toPaise=function(id){var v=document.getElementById(id).value.trim();return v===""?null:Math.round(Number(v)*100)};
+
+function couponBenefits(c){
+  var out=[];
+  if(c.unlimitedMessages) out.push("Unlimited messages");
+  if(c.activationFeePaise!=null) out.push("Activation "+(c.activationFeePaise===0?"free":money(c.activationFeePaise)));
+  if(c.messageFeePaise!=null) out.push(money(c.messageFeePaise)+"/message");
+  if(c.walletCreditPaise) out.push(money(c.walletCreditPaise)+" credit");
+  return out.join(" · ");
+}
+
+async function loadCoupons(){
+  showErr("");
+  try{
+    var d=await api("/coupons");
+    if(!d.coupons.length){document.getElementById("c-table").innerHTML='<div class="empty">No coupons yet.</div>';return}
+    document.getElementById("c-table").innerHTML="<table><thead><tr><th>Code</th><th>Benefits</th><th>Used</th><th>Expires</th><th>Status</th><th>Share link</th><th></th></tr></thead><tbody>"+
+      d.coupons.map(function(c){
+        return "<tr><td><b>"+esc(c.code)+"</b><div class='muted'>"+esc(c.description||"")+"</div></td><td>"+esc(couponBenefits(c))+"</td><td>"+
+          c.redemptionCount+(c.maxRedemptions?" / "+c.maxRedemptions:"")+"</td><td>"+(c.expiresAt?esc(new Date(c.expiresAt).toLocaleDateString()):'<span class="muted">never</span>')+
+          "</td><td>"+(c.active?'<span class="badge ok">active</span>':'<span class="badge bad">disabled</span>')+
+          "</td><td class='link'>"+esc(c.shareUrl)+"</td><td><div class='row'><button class='btn ghost' data-copy='"+esc(c.shareUrl)+"'>Copy link</button>"+
+          "<button class='btn "+(c.active?"danger":"ghost")+"' data-toggle='"+esc(c._id)+"' data-active='"+c.active+"'>"+(c.active?"Disable":"Enable")+"</button></div></td></tr>";
+      }).join("")+"</tbody></table>";
+    Array.prototype.forEach.call(document.querySelectorAll("[data-copy]"),function(b){
+      b.onclick=function(e){e.stopPropagation();copyLink(b.dataset.copy)};
+    });
+    Array.prototype.forEach.call(document.querySelectorAll("[data-toggle]"),function(b){
+      b.onclick=async function(e){
+        e.stopPropagation();
+        try{await api("/coupons/"+encodeURIComponent(b.dataset.toggle),{method:"PATCH",body:JSON.stringify({active:b.dataset.active!=="true"})});await loadCoupons()}
+        catch(err){showErr(err.message)}
+      };
+    });
+  }catch(e){ showErr(e.message) }
+}
+
+function copyLink(url){
+  if(navigator.clipboard) navigator.clipboard.writeText(url).then(function(){showOk("Link copied: "+url)},function(){prompt("Copy this link",url)});
+  else prompt("Copy this link",url);
+}
+
+async function createCouponFromForm(){
+  showErr("");
+  var exp=document.getElementById("c-exp").value;
+  var body={
+    code:document.getElementById("c-code").value.trim(),
+    description:document.getElementById("c-desc").value.trim(),
+    unlimitedMessages:document.getElementById("c-unl").value==="true",
+    activationFeePaise:toPaise("c-act"),
+    messageFeePaise:toPaise("c-msg"),
+    walletCreditPaise:toPaise("c-wallet"),
+    maxRedemptions:document.getElementById("c-max").value.trim()||null,
+    // End of the chosen day, so "expires 31 Dec" still works on 31 Dec.
+    expiresAt:exp?new Date(exp+"T23:59:59").toISOString():null
+  };
+  var btn=document.getElementById("c-create");btn.disabled=true;
+  try{
+    var c=await api("/coupons",{method:"POST",body:JSON.stringify(body)});
+    document.getElementById("c-made").innerHTML="Created <b>"+esc(c.coupon.code)+"</b> · <span class='link'>"+esc(c.coupon.shareUrl)+"</span>";
+    ["c-code","c-desc","c-act","c-msg","c-wallet","c-max","c-exp"].forEach(function(id){document.getElementById(id).value=""});
+    copyLink(c.coupon.shareUrl);
+    await loadCoupons();
+  }catch(e){ showErr(e.message) }finally{ btn.disabled=false }
+}
+
+document.querySelector('nav button[data-tab="coupons"]').onclick=function(){
+  state.model=null;
+  setTab("coupons","Coupons","Custom pricing you can share as a link");
+  this.classList.add("active");
+  loadCoupons();
+};
+document.getElementById("c-create").onclick=createCouponFromForm;
+
 document.querySelector('nav button[data-tab="overview"]').onclick=function(){
   setTab("overview","Overview","Operations console");
   this.classList.add("active");
@@ -403,6 +502,33 @@ export function mountAdmin(app: Express, config: AdminConfig) {
       mongo: mongoose.connection.readyState === 1 ? "ready" : "down",
       uptime: Math.round(process.uptime()),
     });
+  }));
+
+  const shareUrl = (code: string) => (config.shareBase || "").replace(/\/$/, "") + "/?coupon=" + encodeURIComponent(code);
+  const couponRow = (c: any) => ({ ...c, _id: String(c._id), shareUrl: shareUrl(c.code) });
+
+  app.get("/admin/api/coupons", guard, wrap(async (_req, res) => {
+    const rows = await Coupon.find().sort({ createdAt: -1 }).limit(200).lean();
+    res.json({ coupons: rows.map(couponRow) });
+  }));
+
+  app.post("/admin/api/coupons", guard, wrap(async (req, res) => {
+    try {
+      const coupon: any = await createCoupon(req.body);
+      console.log(JSON.stringify({ event: "admin.coupon_created", code: coupon.code }));
+      res.status(201).json({ coupon: couponRow(coupon.toObject()) });
+    } catch (e: any) {
+      if (e instanceof CouponError) return res.status(e.statusCode).json({ error: e.message });
+      throw e;
+    }
+  }));
+
+  app.patch("/admin/api/coupons/:id", guard, wrap(async (req, res) => {
+    if (!mongoose.isValidObjectId(String(req.params.id))) return res.status(400).json({ error: "Not a valid id" });
+    const doc = await Coupon.findByIdAndUpdate(String(req.params.id), { $set: { active: req.body?.active === true } }, { new: true }).lean();
+    if (!doc) return res.status(404).json({ error: "Not found" });
+    console.log(JSON.stringify({ event: "admin.coupon_toggled", code: (doc as any).code, active: (doc as any).active }));
+    res.json({ coupon: couponRow(doc) });
   }));
 
   /// Every registered model, discovered rather than listed, so a collection

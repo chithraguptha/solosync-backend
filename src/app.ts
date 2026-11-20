@@ -16,6 +16,7 @@ import {
   reserveMessageCredit, finalizeMessageCredit, releaseMessageCredit, creditWallet,
 } from "./billing";
 import { mountAdmin } from "./admin";
+import { CouponError, previewCoupon, redeemCoupon } from "./coupons";
 import { openapi } from "./openapi";
 import { API_KEY_SCOPES, authenticateApiKey, createApiKey, hasApiKeyScope, listApiKeys, revokeApiKey, rotateApiKey } from "./apiKeys";
 
@@ -62,6 +63,11 @@ const User = mongoose.model("User", new Schema(
     // Set by an admin for accounts that send without paying: no activation
     // fee, no wallet, no per-message charge. Suspension still applies.
     unlimitedMessages: { type: Boolean, default: false },
+    // Per-account prices, usually set by redeeming a coupon. Unset means the
+    // standard ACTIVATION_FEE_PAISE / MESSAGE_FEE_PAISE.
+    customActivationFeePaise: { type: Number, min: 0 },
+    customMessageFeePaise: { type: Number, min: 0 },
+    couponCode: String,
   },
   { timestamps: true },
 ));
@@ -97,6 +103,10 @@ const Publication = mongoose.model("Publication", new Schema(
     // at publish or failure time would let an admin toggling it mid-flight
     // finalize or release a reservation that was never made.
     billed: { type: Boolean, default: true },
+    // The price when queued, for the same reason as billed: a coupon redeemed
+    // mid-flight must not change what the reservation is settled at. Messages
+    // queued before this field existed were charged the standard fee.
+    feePaise: Number,
     text: String,
     mediaUrl: String,
     status: { type: String, enum: ["queued", "publishing", "published", "failed"], default: "queued", index: true },
@@ -258,6 +268,21 @@ function wasBilled(p: any) {
   return env.BILLING_ENABLED && p?.billed !== false;
 }
 
+/// The activation fee this account pays.
+function activationFeeFor(user: any) {
+  return user?.customActivationFeePaise ?? env.ACTIVATION_FEE_PAISE;
+}
+
+/// The price of one message for this account.
+function messageFeeFor(user: any) {
+  return user?.customMessageFeePaise ?? env.MESSAGE_FEE_PAISE;
+}
+
+/// The price an existing message was queued at.
+function feeOf(p: any) {
+  return p?.feePaise ?? env.MESSAGE_FEE_PAISE;
+}
+
 function developerError(res: express.Response, error: any) {
   const status = Number(error?.statusCode || 500);
   return res.status(status).json({ error: { message: error?.message || "Request failed" } });
@@ -275,11 +300,11 @@ async function recordActivation(userId: string, c: any) {
   await mongoose.model("User").findByIdAndUpdate(userId, { billingStatus: "ACTIVE" });
 }
 
-async function recordMessage(userId: string, publicationId: any) {
+async function recordMessage(userId: string, publicationId: any, amountPaise = env.MESSAGE_FEE_PAISE) {
   const exists = await BillingLedger.exists({ publicationId, kind: "message" });
   if (exists) return;
   await BillingLedger.create({
-    userId, publicationId, kind: "message", units: 1, amountPaise: env.MESSAGE_FEE_PAISE,
+    userId, publicationId, kind: "message", units: 1, amountPaise,
     status: "recorded",
     note: env.BILLING_ENABLED ? "Payment provider integration pending" : "Test mode: payment disabled",
   });
@@ -303,8 +328,8 @@ async function markPublicationPublished(p: any, providerMessageId: string, deliv
   p.publishedAt = publishedAt || p.publishedAt || new Date();
   p.error = undefined;
   await p.save();
-  await finalizeMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), wasBilled(p));
-  await recordMessage(String(p.userId), p._id);
+  await finalizeMessageCredit(String(p.userId), feeOf(p), String(p._id), wasBilled(p));
+  await recordMessage(String(p.userId), p._id, feeOf(p));
 }
 
 async function reconcilePublicationWithWaha(p: any, c: any) {
@@ -395,7 +420,7 @@ async function publish(publicationId: string) {
       nextStatus: p.status,
       error: p.error,
     }));
-    if (p.status === "failed") await releaseMessageCredit(String(p.userId), env.MESSAGE_FEE_PAISE, String(p._id), wasBilled(p));
+    if (p.status === "failed") await releaseMessageCredit(String(p.userId), feeOf(p), String(p._id), wasBilled(p));
     throw error;
   }
 }
@@ -458,7 +483,7 @@ async function recoverStuckPublications() {
       if (!updated) continue;
       await releaseMessageCredit(
         String(updated.userId),
-        env.MESSAGE_FEE_PAISE,
+        feeOf(updated),
         String(updated._id),
         wasBilled(updated),
       );
@@ -773,18 +798,18 @@ app.post("/api/whatsapp/publish", async (req, res) => {
     if (!["text", "image", "video"].includes(kind)) return res.status(400).json({ message: "Unsupported message kind" });
     const session: any = await waha.getSession(c.sessionName);
     if (session.status !== "WORKING") return res.status(409).json({ message: "WhatsApp session is not ready", status: session.status });
-    const billed = billable(user);
-    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl, billed } as any);
-    const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), billed);
+    const billed = billable(user), feePaise = messageFeeFor(user);
+    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl, billed, feePaise } as any);
+    const reserved = await reserveMessageCredit(String(user._id), feePaise, String(p._id), billed);
     if (!reserved) { await p.deleteOne(); return res.status(402).json({ message: "Insufficient wallet balance. Top up your wallet to send messages.", code: "INSUFFICIENT_BALANCE" }); }
     try {
       await redis.lPush("solosync:publish", JSON.stringify({ publicationId: String(p._id) }));
     } catch (error) {
-      await releaseMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), billed);
+      await releaseMessageCredit(String(user._id), feePaise, String(p._id), billed);
       await p.deleteOne();
       throw error;
     }
-    res.status(202).json({ publication: { id: String(p._id), status: "queued", feePaise: billed ? env.MESSAGE_FEE_PAISE : 0 } });
+    res.status(202).json({ publication: { id: String(p._id), status: "queued", feePaise: billed ? feePaise : 0 } });
   } catch (e: any) { res.status(500).json({ message: e.message || "Unable to queue message" }); }
 });
 
@@ -842,7 +867,7 @@ app.get("/api/billing/summary", async (req, res) => {
     const rows: any[] = await BillingLedger.find({ userId: user._id }).sort({ createdAt: -1 }).limit(100).lean();
     const total = rows.reduce((s, r) => s + r.amountPaise, 0);
     const messages = rows.filter(r => r.kind === "message").reduce((s, r) => s + r.units, 0);
-    res.json({ billingEnabled: env.BILLING_ENABLED, activationFeePaise: env.ACTIVATION_FEE_PAISE, messageFeePaise: env.MESSAGE_FEE_PAISE, messageCount: messages, recordedAmountPaise: total, recordedAmountRupees: total / 100, entries: rows });
+    res.json({ billingEnabled: env.BILLING_ENABLED, activationFeePaise: activationFeeFor(user), messageFeePaise: messageFeeFor(user), messageCount: messages, recordedAmountPaise: total, recordedAmountRupees: total / 100, entries: rows });
   } catch (e: any) { res.status(401).json({ message: e.message || "Unable to read billing" }); }
 });
 
@@ -897,8 +922,8 @@ app.get("/v1/account", async (req, res) => {
         enabled: env.BILLING_ENABLED,
         status: user.billingStatus || "ACTIVE",
         unlimitedMessages: !!user.unlimitedMessages,
-        activationFeePaise: env.ACTIVATION_FEE_PAISE,
-        messageFeePaise: env.MESSAGE_FEE_PAISE,
+        activationFeePaise: activationFeeFor(user),
+        messageFeePaise: messageFeeFor(user),
         wallet: { balancePaise: wallet?.balancePaise || 0, reservedPaise: wallet?.reservedPaise || 0 },
       },
     });
@@ -1010,18 +1035,18 @@ app.post("/v1/messages", async (req, res) => {
     if (!["text", "image", "video"].includes(kind)) return res.status(400).json({ error: { message: "Unsupported message kind" } });
     const session: any = await waha.getSession(c.sessionName);
     if (session.status !== "WORKING") return res.status(409).json({ error: { code: "WHATSAPP_NOT_READY", message: "WhatsApp session is not ready", status: session.status } });
-    const billed = billable(user);
-    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl, billed } as any);
-    const reserved = await reserveMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), billed);
+    const billed = billable(user), feePaise = messageFeeFor(user);
+    const p: any = await Publication.create({ userId: user._id, connectionId: c._id, chatId, kind, text, mediaUrl, billed, feePaise } as any);
+    const reserved = await reserveMessageCredit(String(user._id), feePaise, String(p._id), billed);
     if (!reserved) { await p.deleteOne(); return res.status(402).json({ error: { code: "INSUFFICIENT_BALANCE", message: "Insufficient wallet balance" } }); }
     try {
       await redis.lPush("solosync:publish", JSON.stringify({ publicationId: String(p._id) }));
     } catch (error) {
-      await releaseMessageCredit(String(user._id), env.MESSAGE_FEE_PAISE, String(p._id), billed);
+      await releaseMessageCredit(String(user._id), feePaise, String(p._id), billed);
       await p.deleteOne();
       throw error;
     }
-    res.status(202).json({ id: String(p._id), status: "queued", feePaise: billed ? env.MESSAGE_FEE_PAISE : 0 });
+    res.status(202).json({ id: String(p._id), status: "queued", feePaise: billed ? feePaise : 0 });
   } catch (e: any) { developerError(res, e); }
 });
 
@@ -1035,7 +1060,7 @@ app.get("/v1/messages/:id", async (req, res) => {
     if (!p) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Message not found" } });
     res.json({
       id: String(p._id), chatId: p.chatId, kind: p.kind, status: p.status, deliveryStatus: p.deliveryStatus,
-      attempts: p.attempts, error: p.error || null, feePaise: p.billed === false ? 0 : env.MESSAGE_FEE_PAISE,
+      attempts: p.attempts, error: p.error || null, feePaise: p.billed === false ? 0 : feeOf(p),
       createdAt: p.createdAt, publishedAt: p.publishedAt || null,
     });
   } catch (e: any) { developerError(res, e); }
@@ -1060,7 +1085,7 @@ app.get("/api/billing/config", async (req, res) => {
   try {
     const user: any = await auth(req);
     const wallet: any = await Wallet.findOne({ userId: user._id }).lean();
-    res.json({ enabled: env.BILLING_ENABLED, keyId: env.RAZORPAY_KEY_ID || null, activationFeePaise: env.ACTIVATION_FEE_PAISE, messageFeePaise: env.MESSAGE_FEE_PAISE, billingStatus: user.billingStatus || "ACTIVE", unlimitedMessages: !!user.unlimitedMessages, wallet: wallet ? { balancePaise: wallet.balancePaise, reservedPaise: wallet.reservedPaise } : { balancePaise: 0, reservedPaise: 0 } });
+    res.json({ enabled: env.BILLING_ENABLED, keyId: env.RAZORPAY_KEY_ID || null, activationFeePaise: activationFeeFor(user), messageFeePaise: messageFeeFor(user), standardActivationFeePaise: env.ACTIVATION_FEE_PAISE, standardMessageFeePaise: env.MESSAGE_FEE_PAISE, couponCode: user.couponCode || null, billingStatus: user.billingStatus || "ACTIVE", unlimitedMessages: !!user.unlimitedMessages, wallet: wallet ? { balancePaise: wallet.balancePaise, reservedPaise: wallet.reservedPaise } : { balancePaise: 0, reservedPaise: 0 } });
   } catch (e:any) { res.status(401).json({ message: e.message || "Unable to read billing config" }); }
 });
 
@@ -1069,9 +1094,17 @@ app.post("/api/billing/activation/order", async (req, res) => {
     const user:any = await auth(req);
     if (!env.BILLING_ENABLED) { user.billingStatus = "ACTIVE"; await user.save(); return res.json({ disabled: true, billingStatus: "ACTIVE" }); }
     if (user.billingStatus === "ACTIVE") return res.json({ alreadyActive: true, billingStatus: "ACTIVE" });
-    const existing:any = await Payment.findOne({ userId:user._id, type:"activation", status:"created" }).sort({createdAt:-1});
-    const order = existing ? { id: existing.razorpayOrderId, amount: existing.amountPaise, currency: existing.currency } : await createOrder("activation", String(user._id), env.ACTIVATION_FEE_PAISE, env.RAZORPAY_CURRENCY);
-    res.json({ keyId: env.RAZORPAY_KEY_ID, order, amountPaise: env.ACTIVATION_FEE_PAISE, currency: env.RAZORPAY_CURRENCY });
+    const fee = activationFeeFor(user);
+    // A coupon can make activation free. Razorpay cannot take a zero order.
+    if (fee === 0) {
+      user.billingStatus = "ACTIVE"; await user.save();
+      return res.json({ alreadyActive: true, billingStatus: "ACTIVE" });
+    }
+    // Reuse an unpaid order only at today's price: one opened before a coupon
+    // was redeemed would otherwise charge the old amount.
+    const existing:any = await Payment.findOne({ userId:user._id, type:"activation", status:"created", amountPaise: fee }).sort({createdAt:-1});
+    const order = existing ? { id: existing.razorpayOrderId, amount: existing.amountPaise, currency: existing.currency } : await createOrder("activation", String(user._id), fee, env.RAZORPAY_CURRENCY);
+    res.json({ keyId: env.RAZORPAY_KEY_ID, order, amountPaise: fee, currency: env.RAZORPAY_CURRENCY });
   } catch(e:any) { res.status(500).json({ message:e.message || "Unable to create activation order" }); }
 });
 
@@ -1080,7 +1113,9 @@ app.post("/api/billing/activation/verify", async (req,res) => {
     const user:any=await auth(req);
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature }=req.body||{};
     const p:any=await Payment.findOne({userId:user._id,razorpayOrderId:razorpay_order_id,type:"activation"});
-    if(!p || p.amountPaise!==env.ACTIVATION_FEE_PAISE) return res.status(400).json({message:"Invalid activation order"});
+    // The amount is checked against Razorpay's capture in markPaymentCaptured;
+    // comparing it to the standard fee would reject a coupon-priced order.
+    if(!p) return res.status(400).json({message:"Invalid activation order"});
     if(!verifyCheckoutSignature(razorpay_order_id,razorpay_payment_id,razorpay_signature,env.RAZORPAY_KEY_SECRET)) return res.status(400).json({message:"Invalid payment signature"});
     const captured:any=await processCapturedPayment(razorpay_payment_id);
     captured.razorpaySignature=razorpay_signature; await captured.save();
@@ -1134,6 +1169,31 @@ app.get("/api/billing/wallet", async(req,res)=>{
   catch(e:any){res.status(401).json({message:e.message||"Unable to read wallet"});}
 });
 
+// Coupons
+function couponError(res: express.Response, e: any) {
+  if (e instanceof CouponError) return res.status(e.statusCode).json({ message: e.message, code: e.code });
+  return res.status(e?.statusCode || 500).json({ message: e?.message || "Unable to apply coupon" });
+}
+
+// auth() throws plain errors; the dashboard refreshes its session on a 401.
+const couponAuth = (req: Request) => auth(req).catch((e: any) => { throw Object.assign(e, { statusCode: 401 }); });
+
+app.use("/api/billing/coupons", rateLimit({ windowMs: 60_000, max: 20 }));
+
+app.get("/api/billing/coupons/:code", async (req, res) => {
+  try { const user: any = await couponAuth(req); res.json({ coupon: await previewCoupon(req.params.code, String(user._id)) }); }
+  catch (e: any) { couponError(res, e); }
+});
+
+app.post("/api/billing/coupons/redeem", async (req, res) => {
+  try {
+    const user: any = await couponAuth(req);
+    const coupon = await redeemCoupon(req.body?.code, user);
+    const fresh: any = await User.findById(user._id);
+    res.json({ ok: true, coupon, billingStatus: fresh?.billingStatus || "ACTIVE", activationFeePaise: activationFeeFor(fresh), messageFeePaise: messageFeeFor(fresh), unlimitedMessages: !!fresh?.unlimitedMessages });
+  } catch (e: any) { couponError(res, e); }
+});
+
 app.post("/webhooks/razorpay", async(req,res)=>{
   const signature=req.header("X-Razorpay-Signature")||"";
   const raw=(req as RawRequest).rawBody?.toString("utf8")||"";
@@ -1160,7 +1220,7 @@ app.post("/webhooks/razorpay", async(req,res)=>{
   }catch(e:any){res.status(500).json({message:e.message||"Webhook processing failed"});}
 });
 
-mountAdmin(app, { email: env.ADMIN_EMAIL, password: env.ADMIN_PASSWORD });
+mountAdmin(app, { email: env.ADMIN_EMAIL, password: env.ADMIN_PASSWORD, shareBase: env.FRONTEND_ORIGIN });
 
 app.post("/webhooks/waha", async (req, res) => {
   const raw = (req as RawRequest).rawBody?.toString("utf8") || JSON.stringify(req.body);
@@ -1204,14 +1264,14 @@ app.post("/webhooks/waha", async (req, res) => {
           publication.status = "failed";
           publication.error = "WAHA message acknowledgement reported ERROR";
           await publication.save();
-          await releaseMessageCredit(String(publication.userId), env.MESSAGE_FEE_PAISE, String(publication._id), wasBilled(publication));
+          await releaseMessageCredit(String(publication.userId), feeOf(publication), String(publication._id), wasBilled(publication));
         } else {
           publication.status = "published";
           publication.publishedAt = publication.publishedAt || new Date();
           publication.error = undefined;
           await publication.save();
-          await finalizeMessageCredit(String(publication.userId), env.MESSAGE_FEE_PAISE, String(publication._id), wasBilled(publication));
-          await recordMessage(String(publication.userId), publication._id);
+          await finalizeMessageCredit(String(publication.userId), feeOf(publication), String(publication._id), wasBilled(publication));
+          await recordMessage(String(publication.userId), publication._id, feeOf(publication));
         }
       }
     }

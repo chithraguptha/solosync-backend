@@ -99,7 +99,7 @@ export async function markPaymentCaptured(payment: any) {
   return p;
 }
 
-export async function creditWallet(userId: string, amountPaise: number, referenceId: string, note = "Razorpay wallet top-up") {
+export async function creditWallet(userId: string, amountPaise: number, referenceId: string, note = "Razorpay wallet top-up", referenceType = "payment") {
   if (amountPaise <= 0) throw new Error("Wallet amount must be positive");
   if (await WalletTransaction.exists({ type: "topup", referenceId })) return;
   const wallet: any = await Wallet.findOneAndUpdate(
@@ -111,7 +111,7 @@ export async function creditWallet(userId: string, amountPaise: number, referenc
   await WalletTransaction.create({
     userId, type: "topup", amountPaise,
     balanceBeforePaise: before, balanceAfterPaise: before + amountPaise,
-    referenceType: "payment", referenceId, note,
+    referenceType, referenceId, note,
   });
 }
 
