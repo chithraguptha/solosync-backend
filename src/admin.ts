@@ -1,6 +1,7 @@
 import { Express, Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import { Coupon, CouponError, createCoupon } from "./coupons";
+import { Receipt, receiptHtml } from "./receipts";
 
 /// shareBase is the dashboard origin a coupon link opens, e.g.
 /// https://app.solosync.live.
@@ -184,6 +185,9 @@ section{display:none}section.active{display:block}
         <label class="field"><span>Wallet credit (₹)</span><input id="c-wallet" type="number" min="0" step="1" placeholder="0"></label>
         <label class="field"><span>Max redemptions</span><input id="c-max" type="number" min="1" step="1" placeholder="no limit"></label>
         <label class="field"><span>Expires</span><input id="c-exp" type="date"></label>
+        <label class="field"><span>Multiple WhatsApp numbers</span><select id="c-multi"><option value="false">No</option><option value="true">Yes</option></select></label>
+        <label class="field"><span>Max numbers</span><input id="c-maxconn" type="number" min="1" step="1" placeholder="5"></label>
+        <label class="field"><span>Multi-number price per message (₹)</span><input id="c-multimsg" type="number" min="0" step="0.01" placeholder="standard multi"></label>
       </div>
       <div class="row" style="margin-top:12px"><button class="btn" id="c-create">Create coupon</button><span class="muted" id="c-made"></span></div>
     </div>
@@ -258,7 +262,7 @@ async function loadOverview(){
   ].map(function(x){return '<div class="card"><span>'+x[0]+'</span><strong>'+esc(x[1])+'</strong></div>'}).join("");
   document.getElementById("system").innerHTML=
     "MongoDB <b class='"+(o.mongo==="ready"?"ok":"bad")+"'>"+esc(o.mongo)+"</b> · Billing <b>"+esc(o.billing)+
-    "</b> · Activation "+money(o.activationFeePaise)+" · Per message "+money(o.messageFeePaise)+
+    "</b> · Activation "+money(o.activationFeePaise)+" · Per message "+money(o.messageFeePaise)+" · Multi-number "+money(o.multiMessageFeePaise)+
     " · Uptime "+esc(o.uptime)+"s";
 }
 
@@ -379,6 +383,7 @@ function couponBenefits(c){
   if(c.activationFeePaise!=null) out.push("Activation "+(c.activationFeePaise===0?"free":money(c.activationFeePaise)));
   if(c.messageFeePaise!=null) out.push(money(c.messageFeePaise)+"/message");
   if(c.walletCreditPaise) out.push(money(c.walletCreditPaise)+" credit");
+  if(c.multiNumberEnabled) out.push("Multiple numbers"+(c.maxConnections?" (up to "+c.maxConnections+")":"")+(c.multiMessageFeePaise!=null?" at "+money(c.multiMessageFeePaise)+"/message":""));
   return out.join(" · ");
 }
 
@@ -423,6 +428,9 @@ async function createCouponFromForm(){
     activationFeePaise:toPaise("c-act"),
     messageFeePaise:toPaise("c-msg"),
     walletCreditPaise:toPaise("c-wallet"),
+    multiNumberEnabled:document.getElementById("c-multi").value==="true",
+    maxConnections:document.getElementById("c-maxconn").value.trim()||null,
+    multiMessageFeePaise:toPaise("c-multimsg"),
     maxRedemptions:document.getElementById("c-max").value.trim()||null,
     // End of the chosen day, so "expires 31 Dec" still works on 31 Dec.
     expiresAt:exp?new Date(exp+"T23:59:59").toISOString():null
@@ -431,7 +439,7 @@ async function createCouponFromForm(){
   try{
     var c=await api("/coupons",{method:"POST",body:JSON.stringify(body)});
     document.getElementById("c-made").innerHTML="Created <b>"+esc(c.coupon.code)+"</b> · <span class='link'>"+esc(c.coupon.shareUrl)+"</span>";
-    ["c-code","c-desc","c-act","c-msg","c-wallet","c-max","c-exp"].forEach(function(id){document.getElementById(id).value=""});
+    ["c-code","c-desc","c-act","c-msg","c-wallet","c-max","c-exp","c-maxconn","c-multimsg"].forEach(function(id){document.getElementById(id).value=""});
     copyLink(c.coupon.shareUrl);
     await loadCoupons();
   }catch(e){ showErr(e.message) }finally{ btn.disabled=false }
@@ -499,6 +507,7 @@ export function mountAdmin(app: Express, config: AdminConfig) {
       billing: process.env.BILLING_ENABLED === "true" ? "enabled" : "disabled",
       activationFeePaise: Number(process.env.ACTIVATION_FEE_PAISE || 29900),
       messageFeePaise: Number(process.env.MESSAGE_FEE_PAISE || 50),
+      multiMessageFeePaise: Number(process.env.MULTI_MESSAGE_FEE_PAISE || 100),
       mongo: mongoose.connection.readyState === 1 ? "ready" : "down",
       uptime: Math.round(process.uptime()),
     });
@@ -506,6 +515,13 @@ export function mountAdmin(app: Express, config: AdminConfig) {
 
   const shareUrl = (code: string) => (config.shareBase || "").replace(/\/$/, "") + "/?coupon=" + encodeURIComponent(code);
   const couponRow = (c: any) => ({ ...c, _id: String(c._id), shareUrl: shareUrl(c.code) });
+
+  app.get("/admin/receipts/:id", guard, wrap(async (req, res) => {
+    if (!mongoose.isValidObjectId(String(req.params.id))) return res.status(404).send("Receipt not found");
+    const r = await Receipt.findById(String(req.params.id)).lean();
+    if (!r) return res.status(404).send("Receipt not found");
+    res.type("html").send(receiptHtml(r));
+  }));
 
   app.get("/admin/api/coupons", guard, wrap(async (_req, res) => {
     const rows = await Coupon.find().sort({ createdAt: -1 }).limit(200).lean();
@@ -577,7 +593,7 @@ export function mountAdmin(app: Express, config: AdminConfig) {
 
     const fields = describe(model);
     // Show identifying columns first; the rest are on the record itself.
-    const preferred = ["_id", "email", "name", "userId", "status", "billingStatus", "unlimitedMessages", "type", "kind",
+    const preferred = ["_id", "number", "email", "name", "userId", "status", "billingStatus", "unlimitedMessages", "multiNumberEnabled", "phoneNumber", "isDefault", "type", "kind",
                        "amountPaise", "balancePaise", "chatId", "phoneNumber", "sessionName", "createdAt"];
     const available = fields.map(f => f.name);
     const columns = preferred.filter(c => available.includes(c))

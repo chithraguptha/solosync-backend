@@ -46,7 +46,7 @@ export const openapi = {
     },
     "/v1/connection": {
       get: {
-        summary: "Get WhatsApp connection status",
+        summary: "Get the default WhatsApp number's connection status",
         tags: ["Connection"],
         responses: { "200": { description: "Connection status" }, "401": { description: "Invalid API key" } },
       },
@@ -114,18 +114,76 @@ export const openapi = {
                   text: { type: "string", example: "Hello from SoloSync" },
                   kind: { type: "string", enum: ["text", "image", "video"], default: "text" },
                   mediaUrl: { type: "string", format: "uri", nullable: true, example: "https://cdn.example.com/photo.jpg" },
+                  from: { type: "string", nullable: true, example: "919812345678", description: "The connected WhatsApp number to send from, in any format. Omit to send from the account's default number." },
+                  connectionId: { type: "string", nullable: true, description: "Alternative to `from`: the id of a connection from GET /v1/connections." },
                 },
               },
-              examples: { text: { value: { chatId: "919876543210", text: "Hello from SoloSync" } } },
+              examples: {
+                text: { value: { chatId: "919876543210", text: "Hello from SoloSync" } },
+                fromNumber: { value: { chatId: "919876543210", text: "Hello from our support line", from: "919812345678" } },
+              },
             },
           },
         },
         responses: {
           "202": { description: "Message queued. `feePaise` is 0 for accounts with unlimited messages." },
           "402": { description: "Activation required or insufficient wallet balance (never for accounts with unlimited messages)" },
+          "404": { description: "`from` or `connectionId` names a number not connected to this account (SENDER_NOT_FOUND)" },
           "409": { description: "WhatsApp is not connected or ready" },
           "401": { description: "Invalid API key" },
         },
+      },
+    },
+    "/v1/connections": {
+      get: {
+        summary: "List every WhatsApp number on the account",
+        description: "The default number is first. Accounts with multiple numbers enabled can hold up to `maxConnections`.",
+        tags: ["Connection"],
+        responses: { "200": { description: "Connections, multiNumberEnabled and maxConnections" }, "401": { description: "Invalid API key" } },
+      },
+      post: {
+        summary: "Pair another WhatsApp number",
+        description: "Needs multiple numbers enabled on the account. Returns the new connection and, when pairing is needed, its QR payload. Messages from accounts with multiple numbers are charged the multi-number rate.",
+        tags: ["Connection"],
+        requestBody: { content: { "application/json": { schema: { type: "object", properties: { label: { type: "string", example: "Support line" } } } } } },
+        responses: {
+          "201": { description: "Connection created" },
+          "402": { description: "Activation required" },
+          "403": { description: "Multiple numbers are not enabled for this account (MULTI_NUMBER_DISABLED)" },
+          "409": { description: "The account already has its maximum number of connections (CONNECTION_LIMIT)" },
+          "503": { description: "No WhatsApp capacity is free right now (CAPACITY)" },
+        },
+      },
+    },
+    "/v1/connections/{id}": {
+      get: {
+        summary: "Get one number's connection status",
+        tags: ["Connection"],
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: { "200": { description: "Connection status" }, "404": { description: "No such connection on this account" } },
+      },
+      delete: {
+        summary: "Disconnect one number",
+        description: "If it was the default, the oldest remaining number becomes the default.",
+        tags: ["Connection"],
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: { "200": { description: "Disconnected" }, "404": { description: "No such connection on this account" } },
+      },
+    },
+    "/v1/connections/{id}/qr": {
+      get: {
+        summary: "Get the pairing QR payload for one number",
+        tags: ["Connection"],
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: { "200": { description: "QR image payload" }, "404": { description: "No such connection on this account" } },
+      },
+    },
+    "/v1/connections/{id}/default": {
+      post: {
+        summary: "Make this number the default sender",
+        tags: ["Connection"],
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: { "200": { description: "Default changed" }, "404": { description: "No such connection on this account" } },
       },
     },
     "/v1/messages/{id}": {
