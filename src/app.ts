@@ -43,6 +43,10 @@ const env = {
   // Each WhatsApp number is a browser session on the WAHA host. 0 = no cap;
   // set it to what the host can hold so one account cannot exhaust it.
   WAHA_SESSION_CAPACITY: Number(process.env.WAHA_SESSION_CAPACITY || 0),
+  // Bump when the Terms and Conditions change; everyone is asked to accept
+  // the new version on their next dashboard visit. Must match the version
+  // the dashboard displays (solosync-frontend src/terms.tsx).
+  TERMS_VERSION: process.env.TERMS_VERSION || "2026-11-20",
   RECEIPT_SELLER_NAME: process.env.RECEIPT_SELLER_NAME || "SoloSync",
   RECEIPT_SELLER_ADDRESS: process.env.RECEIPT_SELLER_ADDRESS || "",
   RECEIPT_SELLER_EMAIL: process.env.RECEIPT_SELLER_EMAIL || "",
@@ -82,9 +86,35 @@ const User = mongoose.model("User", new Schema(
     multiNumberEnabled: { type: Boolean, default: false },
     maxConnections: { type: Number, default: 5, min: 1 },
     customMultiMessageFeePaise: { type: Number, min: 0 },
+    termsVersion: String,
+    termsAcceptedAt: Date,
   },
   { timestamps: true },
 ));
+
+/// Append-only evidence of each acceptance: which version, when, from where
+/// and how. The user record holds only the latest; this keeps the history.
+const ConsentLog = mongoose.model("ConsentLog", new Schema(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    document: { type: String, default: "terms" },
+    version: { type: String, required: true },
+    method: { type: String, enum: ["signup", "prompt"], required: true },
+    ip: String,
+    userAgent: String,
+  },
+  { timestamps: true },
+));
+
+async function recordConsent(req: Request, user: any, method: "signup" | "prompt") {
+  user.termsVersion = env.TERMS_VERSION;
+  user.termsAcceptedAt = new Date();
+  await user.save();
+  await ConsentLog.create({
+    userId: user._id, version: env.TERMS_VERSION, method,
+    ip: req.ip, userAgent: String(req.header("user-agent") || "").slice(0, 300),
+  });
+}
 
 const WhatsappConnection = mongoose.model("WhatsappConnection", new Schema(
   {
@@ -227,6 +257,7 @@ const refresh = (id: string) => jwt.sign({ sub: id, type: "refresh", jti: crypto
 const userView = (u: any) => ({
   id: String(u._id), email: u.email, name: u.name || u.email.split("@")[0],
   avatarUrl: u.avatarUrl || null, authProvider: u.authProvider, billingStatus: u.billingStatus || "ACTIVE", unlimitedMessages: !!u.unlimitedMessages, createdAt: u.createdAt,
+  termsVersion: u.termsVersion || null, currentTermsVersion: env.TERMS_VERSION, termsAccepted: u.termsVersion === env.TERMS_VERSION,
 });
 
 async function issueSession(res: express.Response, userId: string) {
@@ -762,11 +793,28 @@ app.post("/api/auth/register", async (req, res) => {
     const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
     if (!/^\S+@\S+\.\S+$/.test(email) || password.length < 8) return res.status(400).json({ message: "Valid email and password of at least 8 characters are required" });
+    // The dashboard sends the version it showed; a stale page showing older
+    // terms must not record consent to a version the person never saw.
+    if (req.body.acceptTerms !== true || req.body.termsVersion !== env.TERMS_VERSION) return res.status(400).json({ message: "Please read and accept the Terms and Conditions to create an account.", code: "TERMS_REQUIRED", currentTermsVersion: env.TERMS_VERSION });
     if (await User.exists({ email })) return res.status(409).json({ message: "Account already exists. Use Google sign-in or sign in with your password." });
     const u: any = await User.create({ email, passwordHash: await bcrypt.hash(password, 12), authProvider: "password" });
+    await recordConsent(req, u, "signup");
     await issueSession(res, String(u._id));
     res.status(201).json({ user: userView(u) });
   } catch { res.status(500).json({ message: "Unable to create account" }); }
+});
+
+/// Consent for accounts that never gave it (Google sign-up, accounts from
+/// before the terms existed) or that last accepted an older version. The
+/// dashboard asks before anything else; the API is not blocked, so existing
+/// integrations keep sending.
+app.post("/api/auth/accept-terms", async (req, res) => {
+  try {
+    const user: any = await auth(req);
+    if (req.body?.accept !== true || req.body?.termsVersion !== env.TERMS_VERSION) return res.status(400).json({ message: "These terms have been updated. Reload the page to read the current version.", code: "TERMS_VERSION_MISMATCH", currentTermsVersion: env.TERMS_VERSION });
+    if (user.termsVersion !== env.TERMS_VERSION) await recordConsent(req, user, "prompt");
+    res.json({ user: userView(user) });
+  } catch (e: any) { res.status(401).json({ message: e.message || "Not authenticated" }); }
 });
 
 app.post("/api/auth/login", async (req, res) => {
